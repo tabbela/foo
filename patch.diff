@@ -1,0 +1,4245 @@
+diff --git a/.gitignore b/.gitignore
+index 74774ad6..9c6be9bb 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -12,4 +12,5 @@
+ **/tests/settings.py
+ **/docs/build/
+ **/docs/.debris/
+-src/celerybeat-schedule.db
+\ No newline at end of file
++src/celerybeat-schedule.db
++nohup.out
+\ No newline at end of file
+diff --git a/requirements/base.txt b/requirements/base.txt
+index 244537c7..09ab1b59 100644
+--- a/requirements/base.txt
++++ b/requirements/base.txt
+@@ -29,3 +29,6 @@ asgi_redis==1.1.0
+ pymongo==3.4.0
+ xlsxwriter==0.9.6
+ graphene-django>=2.0.dev
++django-debug-toolbar
++kafka-python==1.3.5
++asgiref==2.0.1
+diff --git a/requirements/dev.txt b/requirements/dev.txt
+index 30ed0e49..0fc62c2b 100644
+--- a/requirements/dev.txt
++++ b/requirements/dev.txt
+@@ -1,6 +1,5 @@
+ -r base.txt
+ selenium
+-django-debug-toolbar
+ nose2
+ unittest-xml-reporting
+ coverage
+diff --git a/src/adapter/__init__.py b/src/adapter/__init__.py
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/src/adapter/producer.py b/src/adapter/producer.py
+new file mode 100644
+index 00000000..bbed98e2
+--- /dev/null
++++ b/src/adapter/producer.py
+@@ -0,0 +1,49 @@
++import json
++
++from django.conf import settings
++from kafka import KafkaProducer
++
++from data_log.static_data import mappings
++from static_data import params
++
++
++def format_pulse(pulse):
++
++    return {
++        'name': 'IN' + str(pulse.number) + '.' + params.IN_CNTR,
++        'value': pulse.value,
++        'type': 'diff',
++        'ts': pulse.timestamp.isoformat()
++    }
++
++
++def format_data_log(data_log, classes, **kwargs):
++    res = []
++    for i in (j for j in mappings.DATABASE_MAPPING if j[2] in classes):
++        value = getattr(data_log, i[0])
++        if not value:
++            continue
++        data = {
++            'name': i[2] + '.' + i[1],
++            'value': value,
++            'ts': data_log.timestamp.isoformat()
++        }
++        data.update(kwargs)
++        res.append(data)
++    return res
++
++
++def format_measurement_data_log(data_log):
++    return format_data_log(data_log, classes=(params.AVGT_CLASS, params.AVGE_CLASS))
++
++
++def format_energy_data_log(data_log):
++    return format_data_log(data_log, classes=(params.NRG_CLASS,), type='diff')
++
++
++def send_data(data):
++    backend = '{}:{}'.format(settings.V2_BACKEND['HOST'], settings.V2_BACKEND['PORT'])
++    topic = settings.V2_BACKEND['DATA_TOPIC']
++    producer = KafkaProducer(bootstrap_servers=backend, value_serializer=lambda v: json.dumps(v).encode('utf-8'))
++    producer.send(topic, data)
++    producer.close()
+diff --git a/src/adapter/tasks.py b/src/adapter/tasks.py
+new file mode 100644
+index 00000000..dd8fa49f
+--- /dev/null
++++ b/src/adapter/tasks.py
+@@ -0,0 +1,51 @@
++from django.conf import settings
++
++from celery import shared_task
++
++from adapter.producer import format_pulse, format_measurement_data_log, format_energy_data_log, send_data
++from data_log.models import MeasurementsDataLog, EnergyDataLog
++
++from reports.models import Report
++
++
++def forward_report(report):
++    """
++    Forwards data to the V2 BACKEND.
++    Requires:
++        The Feature should be enabled.
++        The device should have a known id in the V2 (device.ems_id).
++        The report should contain pulses or data logs.
++    Args:
++        report: the report instance
++
++    """
++    if not settings.V2_BACKEND['ENABLE'] or report.device.ems_id is None:
++        return
++    if report.datalog_set.count() == 0 and report.pulse_set.count() == 0:
++        return
++    send_report_data.delay(report.id)
++
++
++def get_report_data(report):
++    if not report.device.ems_id:
++        return
++    res = {
++        'device_id': report.device.ems_id,
++        'data': []
++    }
++    for pulse in report.pulse_set.all():
++        res['data'].append(format_pulse(pulse))
++    for measurement in MeasurementsDataLog.objects.filter(report=report):
++        res['data'] += format_measurement_data_log(measurement)
++    for energy in EnergyDataLog.objects.filter(report=report):
++        res['data'] += format_energy_data_log(energy)
++    return res
++
++
++@shared_task(name='forward_report', ignore_result=True)
++def send_report_data(report_id):
++    report = Report.objects.get(id=report_id)
++    res = get_report_data(report)
++    if not len(res['data']):
++        return
++    send_data(res)
+diff --git a/src/adapter/tests.py b/src/adapter/tests.py
+new file mode 100644
+index 00000000..9db79533
+--- /dev/null
++++ b/src/adapter/tests.py
+@@ -0,0 +1,102 @@
++from datetime import datetime
++from pytz import utc
++
++from django.test import TestCase
++
++from data_log.models import DataLog, Pulse
++from devices.models import Device
++from reports.models import Report
++from adapter.tasks import get_report_data
++from transformers.models import Site
++
++
++class AdapterFormatTest(TestCase):
++
++    def setUp(self):
++        self.device = Device.create()
++        self.device.ems_id = 20
++        self.device.save()
++        self.report = Report.create(device=self.device)
++        Site.create(device=self.device)
++        self.t1 = datetime(year=2018, month=1, day=13, hour=15, minute=1, tzinfo=utc)
++        self.t2 = datetime(year=2018, month=1, day=13, hour=15, minute=2, tzinfo=utc)
++
++    def test_pulse_format(self):
++        Pulse.objects.create(device=self.device, pulses=5, report=self.report, timestamp=self.t1, number=1, value=20)
++        Pulse.objects.create(device=self.device, pulses=10, report=self.report, timestamp=self.t2, number=7, value=40)
++        res = get_report_data(self.report)
++        expected_res = {
++            'device_id': self.device.ems_id,
++            'data': [
++                {'name': 'IN1.cntr', 'value': 20, 'ts': self.t1.isoformat(), 'type': 'diff'},
++                {'name': 'IN7.cntr', 'value': 40, 'ts': self.t2.isoformat(), 'type': 'diff'}
++            ]
++        }
++        self.assertEqual(res['device_id'], expected_res['device_id'])
++        self.assertCountEqual(res['data'], expected_res['data'])
++
++    def test_measurement_format(self):
++        DataLog.objects.create(device=self.device, report=self.report, timestamp=self.t1, va=5, vb=6, vc=7)
++        DataLog.objects.create(device=self.device, report=self.report, timestamp=self.t2, va=10, vb=12, vc=14)
++        res = get_report_data(self.report)
++        expected_res = {
++            'device_id': self.device.ems_id,
++            'data': [
++                {'name': 'AVGE.Va', 'value': 5, 'ts': self.t1.isoformat()},
++                {'name': 'AVGE.Vb', 'value': 6, 'ts': self.t1.isoformat()},
++                {'name': 'AVGE.Vc', 'value': 7, 'ts': self.t1.isoformat()},
++                {'name': 'AVGE.Va', 'value': 10, 'ts': self.t2.isoformat()},
++                {'name': 'AVGE.Vb', 'value': 12, 'ts': self.t2.isoformat()},
++                {'name': 'AVGE.Vc', 'value': 14, 'ts': self.t2.isoformat()}
++            ]
++        }
++        self.assertEqual(res['device_id'], expected_res['device_id'])
++        self.assertCountEqual(res['data'], expected_res['data'])
++
++    def test_energy_format(self):
++        DataLog.objects.create(device=self.device, report=self.report, timestamp=self.t1, eia=15, eib=18, eic=21)
++        DataLog.objects.create(device=self.device, report=self.report, timestamp=self.t2, eia=20, eib=24, eic=28)
++        res = get_report_data(self.report)
++        expected_res = {
++            'device_id': self.device.ems_id,
++            'data': [
++                {'name': 'NRG.Eia', 'value': 15, 'ts': self.t1.isoformat(), 'type': 'diff'},
++                {'name': 'NRG.Eib', 'value': 18, 'ts': self.t1.isoformat(), 'type': 'diff'},
++                {'name': 'NRG.Eic', 'value': 21, 'ts': self.t1.isoformat(), 'type': 'diff'},
++                {'name': 'NRG.Eia', 'value': 20, 'ts': self.t2.isoformat(), 'type': 'diff'},
++                {'name': 'NRG.Eib', 'value': 24, 'ts': self.t2.isoformat(), 'type': 'diff'},
++                {'name': 'NRG.Eic', 'value': 28, 'ts': self.t2.isoformat(), 'type': 'diff'}
++            ]
++        }
++        self.assertEqual(res['device_id'], expected_res['device_id'])
++        self.assertCountEqual(res['data'], expected_res['data'])
++
++    def test_multiple_params(self):
++        DataLog.objects.create(device=self.device, report=self.report, timestamp=self.t1, va=5, vb=6, vc=7)
++        DataLog.objects.create(device=self.device, report=self.report, timestamp=self.t2, va=10, vb=12, vc=14)
++        DataLog.objects.create(device=self.device, report=self.report, timestamp=self.t1, eia=15, eib=18, eic=21)
++        DataLog.objects.create(device=self.device, report=self.report, timestamp=self.t2, eia=20, eib=24, eic=28)
++        Pulse.objects.create(device=self.device, pulses=5, report=self.report, timestamp=self.t1, number=1, value=20)
++        Pulse.objects.create(device=self.device, pulses=10, report=self.report, timestamp=self.t2, number=2, value=40)
++        res = get_report_data(self.report)
++        expected_res = {
++            'device_id': self.device.ems_id,
++            'data': [
++                {'name': 'IN1.cntr', 'value': 20, 'ts': self.t1.isoformat(), 'type': 'diff'},
++                {'name': 'IN2.cntr', 'value': 40, 'ts': self.t2.isoformat(), 'type': 'diff'},
++                {'name': 'AVGE.Va', 'value': 5, 'ts': self.t1.isoformat()},
++                {'name': 'AVGE.Vb', 'value': 6, 'ts': self.t1.isoformat()},
++                {'name': 'AVGE.Vc', 'value': 7, 'ts': self.t1.isoformat()},
++                {'name': 'AVGE.Va', 'value': 10, 'ts': self.t2.isoformat()},
++                {'name': 'AVGE.Vb', 'value': 12, 'ts': self.t2.isoformat()},
++                {'name': 'AVGE.Vc', 'value': 14, 'ts': self.t2.isoformat()},
++                {'name': 'NRG.Eia', 'value': 15, 'ts': self.t1.isoformat(), 'type': 'diff'},
++                {'name': 'NRG.Eib', 'value': 18, 'ts': self.t1.isoformat(), 'type': 'diff'},
++                {'name': 'NRG.Eic', 'value': 21, 'ts': self.t1.isoformat(), 'type': 'diff'},
++                {'name': 'NRG.Eia', 'value': 20, 'ts': self.t2.isoformat(), 'type': 'diff'},
++                {'name': 'NRG.Eib', 'value': 24, 'ts': self.t2.isoformat(), 'type': 'diff'},
++                {'name': 'NRG.Eic', 'value': 28, 'ts': self.t2.isoformat(), 'type': 'diff'}
++            ]
++        }
++        self.assertEqual(res['device_id'], expected_res['device_id'])
++        self.assertCountEqual(res['data'], expected_res['data'])
+diff --git a/src/alarms/admin.py b/src/alarms/admin.py
+index 1a0c218c..2168a741 100644
+--- a/src/alarms/admin.py
++++ b/src/alarms/admin.py
+@@ -5,10 +5,11 @@ from import_export import resources
+ from import_export.fields import Field
+ from suit.widgets import SuitSplitDateTimeWidget
+ 
++from utils.pagination import LargeTablePaginator
+ from .models import Alarm, AddressBook, NotificationHistory, EnergyAlertConfiguration, EnergyAlert
+ from .enum import AlarmState
+ from .forms import AddressBookForm
+-from utils.admin import ExportMixin
++from utils.admin import ExportMixin, AdminItemsPerPage
+ 
+ 
+ class Export(resources.ModelResource):
+@@ -46,7 +47,8 @@ class AlarmModelForm(ModelForm):
+         }
+ 
+ 
+-class AlarmAdmin(ExportMixin, admin.ModelAdmin):
++class AlarmAdmin(AdminItemsPerPage, ExportMixin, admin.ModelAdmin):
++    paginator = LargeTablePaginator
+     # export
+     resource_class = Export
+     # display
+@@ -85,7 +87,7 @@ class AlarmAdmin(ExportMixin, admin.ModelAdmin):
+         }
+ 
+ 
+-class AddressBookAdmin(admin.ModelAdmin):
++class AddressBookAdmin(AdminItemsPerPage, admin.ModelAdmin):
+     search_fields = ('id', 'name', 'phone', 'email')
+     form = AddressBookForm
+     list_display = ('id', 'get_customer', 'name', 'phone', 'email', 'get_custom_action')
+@@ -123,7 +125,7 @@ class AddressBookAdmin(admin.ModelAdmin):
+         }
+ 
+ 
+-class NotificationHistoryAdmin(admin.ModelAdmin):
++class NotificationHistoryAdmin(AdminItemsPerPage, admin.ModelAdmin):
+     list_filter = ('address_book__customer',)
+     list_display_links = None
+     list_display = ('id', 'get_customer', 'get_address_book', 'instance', 'sending_date', 'type')
+@@ -146,11 +148,11 @@ class NotificationHistoryAdmin(admin.ModelAdmin):
+             return {'class': 'error'}
+ 
+ 
+-class EnergyAlertConfigurationAdmin(admin.ModelAdmin):
++class EnergyAlertConfigurationAdmin(AdminItemsPerPage, admin.ModelAdmin):
+     list_display = ('id', 'name', 'type', 'period', 'threshold', 'sites_count')
+ 
+ 
+-class EnergyAlertAdmin(admin.ModelAdmin):
++class EnergyAlertAdmin(AdminItemsPerPage, admin.ModelAdmin):
+     list_display = ('id', 'name', 'site', 'timestamp', 'type', 'period', 'threshold', 'value')
+ 
+ 
+diff --git a/src/alarms/models.py b/src/alarms/models.py
+index 742aef8a..0ff34f15 100644
+--- a/src/alarms/models.py
++++ b/src/alarms/models.py
+@@ -18,7 +18,21 @@ from .enum import AlarmType, Priorities, AlarmState, NotificationMethod, Notific
+     EnergyAlertConfigPeriodChoices
+ 
+ 
++class BaseManager(models.Manager):
++    def manager_only_method(self):
++        return
++
++
++class CustomQuerySet(models.QuerySet):
++    def filter(self, *args, **kwargs):
++        group__in = kwargs.pop('group__in', None)
++        if group__in:
++            return super().filter(site__group__in=group__in, *args, **kwargs)
++        return super().filter(*args, **kwargs)
++
++
+ class Alarm(models.Model):
++    objects = BaseManager.from_queryset(CustomQuerySet)()
+     name = models.CharField(verbose_name=_('Type'), max_length=50, choices=AlarmType.opt_group_iterable_choices())
+     trigger_time = models.DateTimeField(verbose_name=_('Trigger time'))
+     clear_time = models.DateTimeField(verbose_name=_('Clear Time'), null=True, blank=True)
+diff --git a/src/alarms/schema.py b/src/alarms/schema.py
+new file mode 100644
+index 00000000..1d4b507d
+--- /dev/null
++++ b/src/alarms/schema.py
+@@ -0,0 +1,160 @@
++import ast
++
++import graphene
++from django.db.models import Count
++from graphene_django.types import DjangoObjectType
++
++from stats.utils import get_time_intervals
++from utils.access import limit_queryset_access
++from utils.pagination import get_page
++from utils.validators import validate_datetime
++from .models import Alarm
++
++
++class ValueDescGraph(graphene.ObjectType):
++    value = graphene.String()
++    description = graphene.String()
++
++    def resolve_value(self, info, **kwargs):
++        return self.get('value')
++
++    def resolve_description(self, info, **kwargs):
++        return self.get('description')
++
++
++class AlarmSummaryByTypeGraph(graphene.ObjectType):
++    count = graphene.Int()
++    name = graphene.Field(graphene.String)
++
++    def resolve_count(self, info, **kwargs):
++        return self['count']
++
++    def resolve_name(self, info, **kwargs):
++        return self['name']
++
++
++class AlarmSummaryByStatusGraph(graphene.ObjectType):
++    count = graphene.Int()
++    name = graphene.Field(graphene.String)
++
++    def resolve_count(self, info, **kwargs):
++        return self['count']
++
++    def resolve_name(self, info, **kwargs):
++        return self['status']
++
++
++class AlarmSummaryGraph(graphene.ObjectType):
++    count = graphene.Int()
++    alarm_by_type = graphene.List(AlarmSummaryByTypeGraph)
++    alarm_by_status = graphene.List(AlarmSummaryByStatusGraph)
++
++    def resolve_count(self, info, **kwargs):
++        return self.count()
++
++    def resolve_alarm_by_type(self, info, **kwargs):
++        return self.values('name').annotate(count=Count('id', distinct=True))
++
++    def resolve_alarm_by_status(self, info, **kwargs):
++        return self.values('status').annotate(count=Count('id', distinct=True))
++
++
++class AlarmsDataGraph(DjangoObjectType):
++    name = graphene.Field(ValueDescGraph)
++    status = graphene.Field(ValueDescGraph)
++    args = graphene.List(graphene.String)
++
++    class Meta:
++        model = Alarm
++
++    def resolve_name(self, info, **kwargs):
++        description = self.get_name_display()
++        return {
++            'value': self.name,
++            'description': description
++        }
++
++    def resolve_status(self, info, **kwargs):
++        description = self.get_status_display()
++        return {
++            'value': self.status,
++            'description': description
++        }
++
++    def resolve_args(self, info, **kwargs):
++        if self.args:
++            return ast.literal_eval(self.args)
++
++
++class AlarmStatsGraph(graphene.ObjectType):
++    timestamp = graphene.String()
++    value = graphene.Int()
++
++    def resolve_timestamp(self, info, **kwargs):
++        return self.get('timestamp')
++
++    def resolve_value(self, info, **kwargs):
++        return self.get('value')
++
++
++class AlarmsGraph(graphene.ObjectType):
++    data = graphene.List(AlarmsDataGraph)
++    summary = graphene.Field(AlarmSummaryGraph)
++    stats = graphene.List(AlarmStatsGraph)
++
++    def resolve_data(self, info, **kwargs):
++        return self.get('queryset')
++
++    def resolve_summary(self, info, **kwargs):
++        self['queryset'].query.clear_ordering(True)
++        return self.get('queryset')
++
++    def resolve_stats(self, info, **kwargs):
++        if not self['time_intervals']:
++            return
++        stats = []
++        for i in range(len(self['time_intervals']) - 1):
++            stats.append({
++                'timestamp': self['time_intervals'][i],
++                'value': self['queryset'].filter(trigger_time__gte=self['time_intervals'][i],
++                                                 trigger_time__lt=self['time_intervals'][i+1]).count()
++            })
++
++        return stats
++
++
++class Query(graphene.AbstractType):
++    alarms = graphene.Field(AlarmsGraph, site_id=graphene.Int(), start_date=graphene.String(), end_date=graphene.String(),
++                            alarm_type=graphene.String(), alarm_status=graphene.String(), limit=graphene.Int(), offset=graphene.Int(),
++                            display=graphene.String())
++
++    def resolve_alarms(self, info, **kwargs):
++        site_id = kwargs.get('site_id')
++        start_date = kwargs.get('start_date')
++        end_date = kwargs.get('end_date')
++        alarm_type = kwargs.get('alarm_type')
++        alarm_status = kwargs.get('alarm_status')
++        limit = kwargs.get('limit')
++        offset = kwargs.get('offset')
++        display = kwargs.get('display')
++        queryset = limit_queryset_access(Alarm.objects.all(), info)
++        if site_id is not None:
++            queryset = queryset.filter(site__id=site_id)
++        queryset = queryset.order_by('-trigger_time')
++        if start_date and end_date:
++            start_date, end_date = validate_datetime(start_date, end_date)
++            queryset = queryset.filter(trigger_time__gte=start_date, trigger_time__lt=end_date)
++        if alarm_type:
++            queryset = queryset.filter(name=alarm_type)
++        if alarm_status:
++            queryset = queryset.filter(status=alarm_status)
++        queryset = get_page(queryset, limit, offset)
++        if start_date and end_date:
++            time_intervals = get_time_intervals(start_date, end_date, display)
++        else:
++            time_intervals = None
++        print(queryset.count())
++        return {
++            'queryset': queryset,
++            'time_intervals': time_intervals
++        }
+diff --git a/src/commands_handler/admin.py b/src/commands_handler/admin.py
+index b13d2153..fe44675f 100644
+--- a/src/commands_handler/admin.py
++++ b/src/commands_handler/admin.py
+@@ -5,8 +5,9 @@ from django.utils import timezone
+ 
+ from commands_handler.models import Command
+ from utils.access import is_customer_user
++from utils.pagination import LargeTablePaginator
+ from .enum import CommandStatus, ErrorCodes
+-from utils.admin import get_device
++from utils.admin import get_device, AdminItemsPerPage
+ 
+ 
+ def reset_commands(command_admin, request, queryset):
+@@ -30,12 +31,12 @@ def reset_commands(command_admin, request, queryset):
+     reset_commands.short_description = _('Reset command')
+ 
+ 
+-class CommandAdmin(admin.ModelAdmin):
++class CommandAdmin(AdminItemsPerPage, admin.ModelAdmin):
++    paginator = LargeTablePaginator
+     list_display = ('get_details', 'get_name', 'creator', get_device, 'type', 'status', 'get_error_code', 'priority', 'get_creation_date',
+                     'get_last_fetch_time', 'get_response_date', 'get_other_info')
+ 
+     list_filter = ('type', 'status', ('creator', admin.RelatedOnlyFieldListFilter))
+-    ordering = ('-creation_date',)
+     search_fields = ('id', 'device__serial_number', 'name')
+     fields = ('device', 'name', 'type', 'priority', 'args')
+     actions = [reset_commands]
+diff --git a/src/customers/admin.py b/src/customers/admin.py
+index 6d9ebd83..71d63714 100644
+--- a/src/customers/admin.py
++++ b/src/customers/admin.py
+@@ -52,7 +52,6 @@ class CustomerAdmin(ExportMixin, admin.ModelAdmin):
+     list_display = ('id', 'name', 'country', 'city', 'enable', 'get_access_period', 'max_site_nbr', 'get_sites', 'max_usr_nbr',
+                     'get_customer_users', 'language', 'application_name', 'timezone')
+     list_filter = ('enable', 'unlimited_access', 'country__name',)
+-    ordering = ('-creation_date', )
+     search_fields = ('name', 'id',)
+ 
+     def get_sites(self, customer):
+diff --git a/src/customers/views.py b/src/customers/views.py
+index 0b2cdf7a..22070f13 100644
+--- a/src/customers/views.py
++++ b/src/customers/views.py
+@@ -2,7 +2,6 @@ from rest_framework import generics
+ 
+ from .serializers import CustomerReadSerializer, CustomerWriteSerializer
+ from .models import Customer
+-from utils.pagination import AngularDatatablePagination
+ 
+ 
+ class CustomerList(generics.ListCreateAPIView):
+@@ -21,7 +20,6 @@ class CustomerList(generics.ListCreateAPIView):
+         enable(bool): filter customers 0 ==> enable = false
+         unlimited_access(bool):filter customer 0 => unlimited_access = false
+     """
+-    pagination_class = AngularDatatablePagination
+ 
+     def get_queryset(self):
+         queryset = Customer.objects.all()
+diff --git a/src/data_log/admin.py b/src/data_log/admin.py
+index 2864c995..4d4906e2 100644
+--- a/src/data_log/admin.py
++++ b/src/data_log/admin.py
+@@ -1,7 +1,7 @@
+ from datetime import datetime
+ 
+ from django.contrib import admin
+-from django.forms import ModelForm
++from django.forms import ModelForm, NumberInput
+ from django.utils.translation import ugettext as _
+ 
+ from daterange_filter.filter import DateRangeFilter
+@@ -11,13 +11,14 @@ from suit.widgets import SuitSplitDateTimeWidget
+ 
+ from data_log.static_data import params
+ from .models import EnergyDataLog, MeasurementsDataLog, DisplayLoggedParams, Pulse
+-from utils.admin import get_device, ExportMixin
++from utils.admin import ExportMixin, DeviceSearch, AdminItemsPerPage
+ 
+ 
+ class DataLogModelForm(ModelForm):
+     class Meta:
+         widgets = {
+             'timestamp': SuitSplitDateTimeWidget,
++            'report': NumberInput
+         }
+ 
+ 
+@@ -53,11 +54,11 @@ class PulseExport(ExportFromDataLog):
+         fields = ('id', 'device', 'number', 'timestamp', 'value')
+ 
+ 
+-class DataLogAdmin(ExportMixin, admin.ModelAdmin):
++class DataLogAdmin(AdminItemsPerPage, DeviceSearch, ExportMixin, admin.ModelAdmin):
+     form = DataLogModelForm
+     list_filter = (('timestamp', DateRangeFilter), 'interface')
+     list_display_links = None
+-    search_fields = ('id', 'device__serial_number', 'report__id', 'device__customer__name')
++    search_fields = ('device__serial_number',)
+ 
+     def has_delete_permission(self, request, obj=None):
+         return True
+@@ -70,9 +71,6 @@ class DataLogAdmin(ExportMixin, admin.ModelAdmin):
+         date_time = str(datetime.now()).split('.')[0] + "." + file_extension
+         return "DataLog-" + date_time
+ 
+-    get_device.allow_tags = True
+-    get_device.short_description = _('Device Serial Number')
+-
+     def get_report(self, obj):
+         return '<a href="/admin/reports/payload/{}">{}</a>'.format(obj.report.id, obj.report.id)
+     get_report.allow_tags = True
+@@ -86,7 +84,7 @@ class DataLogAdmin(ExportMixin, admin.ModelAdmin):
+ 
+ class MeasurementsDataLogAdmin(DataLogAdmin):
+     resource_class = MeasurementsExport
+-    list_display = ['get_data_log', get_device, 'get_report', 'timestamp', 'interface'] + params.MEASUREMENTS_PARAMETERS
++    list_display = ['get_data_log', 'device', 'get_report', 'timestamp', 'interface'] + params.MEASUREMENTS_PARAMETERS
+ 
+     def get_data_log(self, obj):
+         return '<a href="/admin/data_log/measurements/{}" data-toggle="tooltip" title="Display data">{} </a>'.format(obj.id, obj.id)
+@@ -97,7 +95,7 @@ class MeasurementsDataLogAdmin(DataLogAdmin):
+ 
+ class EnergyDataLogAdmin(DataLogAdmin):
+     resource_class = EnergyExport
+-    list_display = ['get_data_log', get_device, 'get_report', 'timestamp', 'interface', 'get_rate'] + params.ENERGY_PARAMETERS
++    list_display = ['get_data_log', 'device', 'get_report', 'timestamp', 'interface', 'get_rate'] + params.ENERGY_PARAMETERS
+ 
+     def get_data_log(self, obj):
+         return '<a href="/admin/data_log/energy/{}" data-toggle="tooltip" title="Display data">{} </a>'.format(obj.id, obj.id)
+@@ -116,7 +114,7 @@ class EnergyDataLogAdmin(DataLogAdmin):
+ 
+ class PulseLogAdmin(DataLogAdmin):
+     resource_class = PulseExport
+-    list_display = ['id', get_device, 'get_report', 'timestamp', 'number', 'value', 'pulses']
++    list_display = ['id', 'device', 'get_report', 'timestamp', 'number', 'value', 'pulses']
+     list_filter = (('timestamp', DateRangeFilter), 'number', 'device__customer')
+ 
+ 
+diff --git a/src/data_log/migrations/0018_datalog_hot_spot_temperature.py b/src/data_log/migrations/0018_datalog_hot_spot_temperature.py
+new file mode 100644
+index 00000000..a968d48a
+--- /dev/null
++++ b/src/data_log/migrations/0018_datalog_hot_spot_temperature.py
+@@ -0,0 +1,19 @@
++# -*- coding: utf-8 -*-
++from __future__ import unicode_literals
++
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('data_log', '0017_auto_20171019_1124'),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name='datalog',
++            name='hot_spot_temperature',
++            field=models.FloatField(verbose_name='Hot spot temperature (°C)', null=True, blank=True),
++        ),
++    ]
+diff --git a/src/data_log/migrations/0019_datalog_efficiency.py b/src/data_log/migrations/0019_datalog_efficiency.py
+new file mode 100644
+index 00000000..ae849588
+--- /dev/null
++++ b/src/data_log/migrations/0019_datalog_efficiency.py
+@@ -0,0 +1,19 @@
++# -*- coding: utf-8 -*-
++from __future__ import unicode_literals
++
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('data_log', '0018_datalog_hot_spot_temperature'),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name='datalog',
++            name='efficiency',
++            field=models.FloatField(blank=True, null=True, verbose_name='Efficiency (%)'),
++        ),
++    ]
+diff --git a/src/data_log/models.py b/src/data_log/models.py
+index 0c378707..a012445a 100644
+--- a/src/data_log/models.py
++++ b/src/data_log/models.py
+@@ -7,7 +7,7 @@ from django.utils import timezone
+ from django.utils.translation import ugettext as _
+ 
+ from data_log.static_data.mappings import LOGGABLE_PARAMS
+-from data_log.utils import set_data_log_calculable_values
++from data_log.utils import set_data_log_calculable_values, get_efficiency
+ from devices.enum import DeviceType, DeviceConfigStatus
+ from energy_cost.models import Rate, EnergyTimeSlot
+ from utils.validators import greater_than_zero
+@@ -66,8 +66,10 @@ class DataLog(models.Model):
+     rtd3 = models.FloatField(verbose_name=_('RTD 3 temperature (°C)'), null=True, blank=True)
+     rtd4 = models.FloatField(verbose_name=_('RTD 4 temperature (°C)'), null=True, blank=True)
+     at = models.FloatField(verbose_name=_('Ambient temperature (°C)'), null=True, blank=True)
++    hot_spot_temperature = models.FloatField(verbose_name=_('Hot spot temperature (°C)'), null=True, blank=True)
+     current_unbalance = models.FloatField(verbose_name=_('Current unbalance (%)'), null=True, blank=True)
+     voltage_unbalance = models.FloatField(verbose_name=_('Voltage unbalance (%)'), null=True, blank=True)
++    efficiency = models.FloatField(verbose_name=_('Efficiency (%)'), null=True, blank=True)
+     # loss
+     loss = models.FloatField(verbose_name=_('Loss (kW)'), null=True, blank=True)
+     i2r_loss = models.FloatField(verbose_name=_('I2R loss (kW)'), null=True, blank=True)
+@@ -220,10 +222,12 @@ class DataLog(models.Model):
+                 meter2_dt = MeasurementsDataLog.objects.filter(timestamp=timestamp, device=device, interface=Interface.meter2).last()
+                 if meter2_dt:
+                     data_log.loss = get_total_loss(data_log, meter2_dt)
++                    data_log.efficiency = get_efficiency(total_active_power=data_log.pt, loss=data_log.loss)
+             else:
+                 meter1_dt = MeasurementsDataLog.objects.filter(timestamp=timestamp, device=device, interface=Interface.meter1).last()
+                 if meter1_dt:
+                     meter1_dt.loss = get_total_loss(data_log, meter1_dt)
++                    meter1_dt.efficiency = get_efficiency(total_active_power=data_log.pt, loss=meter1_dt.loss)
+                     meter1_dt.save()
+         data_log.save()
+ 
+@@ -254,6 +258,15 @@ class DataLog(models.Model):
+         return data_log
+ 
+ 
++@receiver(post_save, sender=DataLog)
++def calculate_loss_of_life(sender, instance, **kwargs):
++    from stats.models import TransformerLossOfLife
++    if instance.freq:
++        TransformerLossOfLife.create(transformer=instance.device.site.transformer,
++                                     timestamp=instance.timestamp,
++                                     hot_spot_temperature=instance.hot_spot_temperature)
++
++
+ @receiver(pre_save, sender=DataLog)
+ def set_data_log_rate(sender, instance, **kwargs):
+     """
+@@ -284,7 +297,7 @@ class MeasurementsManager(models.Manager):
+     customer manager to filter data logs and return only data_logs where there is no energy values
+     """
+     def get_queryset(self):
+-        return super().get_queryset().filter(va__isnull=False)
++        return super().get_queryset().filter(va__isnull=False).exclude(freq=0)
+ 
+ 
+ class MeasurementsDataLog(DataLog):
+diff --git a/src/data_log/schema.py b/src/data_log/schema.py
+index f53cc336..5041f5ae 100644
+--- a/src/data_log/schema.py
++++ b/src/data_log/schema.py
+@@ -2,6 +2,7 @@ import graphene
+ from graphene_django.types import DjangoObjectType
+ 
+ from transformers.models import Site
++from utils.access import limit_queryset_access
+ from utils.validators import validate_datetime
+ from .models import MeasurementsDataLog, PulseCounter
+ from .utilsNEW import get_sites_last_measurements_timestamp, get_last_measurement_fields_metadata, get_energy
+@@ -67,7 +68,7 @@ class LastMeasurementsGraph(DjangoObjectType):
+         return param
+ 
+ 
+-class MinMaxGraph(graphene.ObjectType):
++class MinMaxHistoricalMeasurementsGraph(graphene.ObjectType):
+     value = graphene.Float()
+     timestamp = graphene.String()
+ 
+@@ -75,15 +76,15 @@ class MinMaxGraph(graphene.ObjectType):
+         return self['value']
+ 
+     def resolve_timestamp(self, info, **kwargs):
+-        return MeasurementsDataLog.objects.filter(**{self['param']: self['value']})[0].timestamp
++        return self['queryset'].filter(**{self['param']: self['value']})[0].timestamp
+ 
+ 
+ class HistoricalMeasurementsParamGraph(graphene.ObjectType):
+     name = graphene.String()
+     data = graphene.List(graphene.Float)
+     avg = graphene.Float()
+-    min = graphene.Field(MinMaxGraph)
+-    max = graphene.Field(MinMaxGraph)
++    min = graphene.Field(MinMaxHistoricalMeasurementsGraph)
++    max = graphene.Field(MinMaxHistoricalMeasurementsGraph)
+ 
+     def resolve_data(self, info, **kwargs):
+         return self['data']
+@@ -95,10 +96,10 @@ class HistoricalMeasurementsParamGraph(graphene.ObjectType):
+         return sum(self['data']) / len(self['data'])
+ 
+     def resolve_min(self, info, **kwargs):
+-        return {'value': min(self['data']), 'param': self['name']}
++        return {'value': min(self['data']), 'param': self['name'], 'queryset': self['queryset']}
+ 
+     def resolve_max(self, info, **kwargs):
+-        return {'value': max(self['data']), 'param': self['name']}
++        return {'value': max(self['data']), 'param': self['name'], 'queryset': self['queryset']}
+ 
+ 
+ class HistoricalMeasurementsGraph(graphene.ObjectType):
+@@ -110,7 +111,8 @@ class HistoricalMeasurementsGraph(graphene.ObjectType):
+         for param in kwargs.get('id', []):
+             values_list.append({
+                 "name": param,
+-                "data": self.values_list(param, flat=True)
++                "data": self.values_list(param, flat=True),
++                "queryset": self
+             })
+         return values_list
+ 
+@@ -268,6 +270,8 @@ class EnergyCostDataGraph(graphene.ObjectType):
+     energy = graphene.Float()
+     cost = graphene.Float()
+     unit_cost = graphene.Float()
++    color = graphene.String()
++    time_slot = graphene.String()
+ 
+     def resolve_energy(self, info, **kwargs):
+         return self['energy']
+@@ -278,6 +282,12 @@ class EnergyCostDataGraph(graphene.ObjectType):
+     def resolve_unit_cost(self, info, **kwargs):
+         return self['unit_cost']
+ 
++    def resolve_color(self, info, **kwargs):
++        return self['color']
++
++    def resolve_time_slot(self, info, **kwargs):
++        return self['time_slot']
++
+ 
+ class EnergyCostGraph(graphene.ObjectType):
+     data = graphene.List(EnergyCostDataGraph)
+@@ -305,8 +315,8 @@ class Query(graphene.AbstractType):
+         interface = kwargs.get('interface')
+         if site_id is None:
+             return
++        site = limit_queryset_access(Site.objects.all(), info).filter(id=site_id)
+ 
+-        site = Site.objects.filter(id=site_id, group__in=info.context.user.customeruser.get_groups()).distinct()
+         ts = get_sites_last_measurements_timestamp(site, interface)
+ 
+         return MeasurementsDataLog.objects.get(device__site__in=site, interface=interface, timestamp=ts)
+@@ -319,7 +329,8 @@ class Query(graphene.AbstractType):
+         if site_id is None or start_date is None or end_date is None:
+             return
+         start_date, end_date = validate_datetime(start_date, end_date)
+-        site = Site.objects.filter(group__in=info.context.user.customeruser.get_groups()).distinct().get(id=site_id)
++        site = limit_queryset_access(Site.objects.all(), info).get(id=site_id)
++
+         return MeasurementsDataLog.objects.filter(device__site__id=site.id, timestamp__gte=start_date, timestamp__lt=end_date,
+                                                   interface=interface).order_by('timestamp')
+ 
+@@ -331,7 +342,7 @@ class Query(graphene.AbstractType):
+         display = kwargs.get('display')
+         if site_id is None or start_date is None or end_date is None:
+             return
+-        site = Site.objects.filter(group__in=info.context.user.customeruser.get_groups()).distinct().get(id=site_id)
++        site = limit_queryset_access(Site.objects.all(), info).get(id=site_id)
+         tz = site.customer.get_timezone()
+         start_date, end_date = validate_datetime(start_date, end_date)
+         start_date = start_date.replace(tzinfo=tz)
+@@ -352,7 +363,7 @@ class Query(graphene.AbstractType):
+         interface = kwargs.get('interface', 'meter1')
+         display = kwargs.get('display')
+         details = True
+-        site = Site.objects.filter(id=site_id, group__in=info.context.user.customeruser.get_groups()).distinct()
++        site = limit_queryset_access(Site.objects.all(), info).filter(id=site_id)
+         start_date, end_date = validate_datetime(kwargs.get('start_date'), kwargs.get('end_date'))
+         return consumed_energy_without_shifts(sites=site, start_date=start_date, end_date=end_date, display=display, interface=interface,
+                                               details=details)
+diff --git a/src/data_log/static_data/mappings.py b/src/data_log/static_data/mappings.py
+index d39247bf..a2f4448f 100644
+--- a/src/data_log/static_data/mappings.py
++++ b/src/data_log/static_data/mappings.py
+@@ -257,7 +257,7 @@ CATEGORIES = (
+     (neutral_current, ['ires']),
+     (frequency, ['freq']),
+     (rtd, ['rtd1', 'rtd2', 'rtd3', 'rtd4']),
+-    (ambient_temperature, ['at'])
++    (ambient_temperature, ['at', 'hot_spot_temperature'])
+ )
+ 
+ import data_log.utilsNEW as utils  # NOQA
+diff --git a/src/data_log/static_data/params.py b/src/data_log/static_data/params.py
+index ab255fae..77d21333 100644
+--- a/src/data_log/static_data/params.py
++++ b/src/data_log/static_data/params.py
+@@ -75,11 +75,12 @@ q4c = 'q4c'
+ q4total = 'q4total'
+ current_unbalance = 'current_unbalance'
+ voltage_unbalance = 'voltage_unbalance'
++hot_spot_temperature = 'hot_spot_temperature'
+ 
+ 
+ MEASUREMENTS_PARAMETERS = [
+     va, vb, vc, uab, ubc, uca, ia, ib, ic, ires, pa, pb, pc, pt, qa, qb, qc, qt, sa, sb, sc, st, pfa, pfb, pfc, pft, thda, thdb, thdc,
+-    freq, rtd1, rtd2, rtd3, rtd4, at, loss, i2r_loss, pec_loss, current_unbalance, voltage_unbalance]
++    freq, rtd1, rtd2, rtd3, rtd4, at, loss, i2r_loss, pec_loss, current_unbalance, voltage_unbalance, hot_spot_temperature]
+ 
+ ENERGY_PARAMETERS = [
+     eia, eib, eic, eitotal, eea, eeb, eec, eetotal, sia, sib, sic, sitotal, sea, seb, sec, setotal, q1a, q1b, q1c, q1total, q2a, q2b, q2c,
+@@ -233,6 +234,11 @@ FIELDS_CHOICE_LIST = {
+             'display': lambda params: params['device__type'] == DeviceType.meter,
+             'fields': [i2r_loss, pec_loss],
+         },
++        {
++            # transformer monitoring
++            'display': lambda params: params['transformer_monitoring'] is True,
++            'fields': [hot_spot_temperature],
++        },
+     ],
+     group_measurements: [
+         {
+@@ -282,5 +288,10 @@ FIELDS_CHOICE_LIST = {
+             'display': lambda params: params['rtd4_enable'] is True,
+             'fields': [rtd4],
+         },
++        {
++            # transformer monitoring
++            'display': lambda params: params['transformer_monitoring'] and params['at_enable'],
++            'fields': [hot_spot_temperature],
++        },
+     ],
+ }
+diff --git a/src/data_log/tasks.py b/src/data_log/tasks.py
+new file mode 100644
+index 00000000..ede2b285
+--- /dev/null
++++ b/src/data_log/tasks.py
+@@ -0,0 +1,29 @@
++from celery import shared_task
++from django.db.models import F
++
++from data_log.enum import Interface
++from data_log.models import DataLog
++from devices.enum import DeviceType
++from transformers.enum import SiteType
++from transformers.models import Site
++
++
++@shared_task(name='update_efficiency', ignore_result=True)
++def update_efficiency(site_id):
++    site = Site.objects.get(id=site_id)
++    if site.type != SiteType.transformer_monitoring:
++        return
++    if site.device.type == DeviceType.meter:
++        measurements = DataLog.objects.filter(device=site.device, pt__gt=0, loss__gt=0, va__isnull=False)
++        measurements.update(efficiency=100 * F('pt')/(F('pt') + F('loss')))
++    else:
++        measurements = DataLog.objects.filter(device=site.device, pt__gt=0, loss__gt=0, interface=Interface.meter1, va__isnull=False)
++        for m in measurements:
++            try:
++                n = DataLog.objects.get(device=site.device, interface=Interface.meter2, va__isnull=False, timestamp=m.timestamp)
++                pt = n.pt
++                loss = m.loss
++                m.efficiency = 100 * pt / (pt + loss)
++                m.save()
++            except:
++                pass
+diff --git a/src/data_log/tests/test_models.py b/src/data_log/tests/test_models.py
+index f98f591b..f10e787e 100644
+--- a/src/data_log/tests/test_models.py
++++ b/src/data_log/tests/test_models.py
+@@ -1,19 +1,21 @@
+ import json
+ import copy
+ 
+-from django.test import TestCase, RequestFactory
++from django.test import TestCase, RequestFactory, mock
+ from django.utils import timezone
+ from rest_framework.test import force_authenticate
+ 
+ from customers.models import Customer
+ from data_log.models import DataLog, Pulse, PulseCounter
++from data_log.utils import HotSpot
+ from device_configuration.enum import InputType
+ from device_configuration.models import Config
+ from devices.models import Device
+ from reports.models import Report
+ from reports.tests.reports_body import report_valid, report_with_pulse_counter_only
+ from reports.views import create_report
+-from transformers.models import Site
++from transformers.models import Site, Transformer
++from transformers.enum import TransformerCoolingMethods
+ 
+ 
+ class TestDataLogModel(TestCase):
+@@ -75,3 +77,309 @@ class PulseCounterTest(TestCase):
+         Report.objects.all().delete()
+         create_report(request)
+         self.assertEqual(Pulse.objects.count(), 0)
++
++
++class TestHotSpot(TestCase):
++
++    def test_ON_no_BOT(self):
++        apparent_power = 21.9101963934603
++        rated_power = 630
++        cooling = TransformerCoolingMethods.on
++        ambient_temperature = 36.92
++        top_oil = 52.02
++        bottom_oil = None
++        hot_spot_factor = 1.1
++        winding_temperature_gradient = 21
++        winding_exponent = 1.6
++        ht = HotSpot(
++            apparent_power=apparent_power,
++            rated_power=rated_power,
++            cooling=cooling,
++            ambient_temperature=ambient_temperature,
++            top_oil=top_oil,
++            bottom_oil=bottom_oil,
++            hot_spot_factor=hot_spot_factor,
++            winding_temperature_gradient=winding_temperature_gradient,
++            winding_exponent=winding_exponent
++        )
++        self.assertEqual(round(ht.get_hot_spot(), 7), 53.0934782)
++
++    def test_ON_with_BOT(self):
++        apparent_power = 21.9101963934603
++        rated_power = 630
++        cooling = TransformerCoolingMethods.on
++        ambient_temperature = 36.92
++        top_oil = 52.02
++        bottom_oil = 41.08
++        hot_spot_factor = 1.1
++        winding_temperature_gradient = 21
++        winding_exponent = 1.6
++        ht = HotSpot(
++            apparent_power=apparent_power,
++            rated_power=rated_power,
++            cooling=cooling,
++            ambient_temperature=ambient_temperature,
++            top_oil=top_oil,
++            bottom_oil=bottom_oil,
++            hot_spot_factor=hot_spot_factor,
++            winding_temperature_gradient=winding_temperature_gradient,
++            winding_exponent=winding_exponent
++        )
++        self.assertEqual(round(ht.get_hot_spot(), 7), 52.8974782)
++
++    def test_OF_no_BOT(self):
++        apparent_power = 21.9101963934603
++        rated_power = 630
++        cooling = TransformerCoolingMethods.of
++        ambient_temperature = 36.92
++        top_oil = 52.02
++        bottom_oil = None
++        hot_spot_factor = 1.1
++        winding_temperature_gradient = 21
++        winding_exponent = 1.6
++        with self.assertRaises(NotImplementedError):
++            ht = HotSpot(
++                apparent_power=apparent_power,
++                rated_power=rated_power,
++                cooling=cooling,
++                ambient_temperature=ambient_temperature,
++                top_oil=top_oil,
++                bottom_oil=bottom_oil,
++                hot_spot_factor=hot_spot_factor,
++                winding_temperature_gradient=winding_temperature_gradient,
++                winding_exponent=winding_exponent
++            )
++            ht.get_hot_spot()
++
++    def test_OF_with_BOT(self):
++        apparent_power = 21.9101963934603
++        rated_power = 630
++        cooling = TransformerCoolingMethods.of
++        ambient_temperature = 36.92
++        top_oil = 52.02
++        bottom_oil = 41.08
++        hot_spot_factor = 1.1
++        winding_temperature_gradient = 21
++        winding_exponent = 1.6
++        with self.assertRaises(NotImplementedError):
++            ht = HotSpot(
++                apparent_power=apparent_power,
++                rated_power=rated_power,
++                cooling=cooling,
++                ambient_temperature=ambient_temperature,
++                top_oil=top_oil,
++                bottom_oil=bottom_oil,
++                hot_spot_factor=hot_spot_factor,
++                winding_temperature_gradient=winding_temperature_gradient,
++                winding_exponent=winding_exponent
++            )
++            ht.get_hot_spot()
++
++    def test_OD_no_BOT(self):
++        apparent_power = 21.9101963934603
++        rated_power = 630
++        cooling = TransformerCoolingMethods.od
++        ambient_temperature = 36.92
++        top_oil = 52.02
++        bottom_oil = None
++        hot_spot_factor = 1.1
++        winding_temperature_gradient = 21
++        winding_exponent = 1.6
++        with self.assertRaises(NotImplementedError):
++            ht = HotSpot(
++                apparent_power=apparent_power,
++                rated_power=rated_power,
++                cooling=cooling,
++                ambient_temperature=ambient_temperature,
++                top_oil=top_oil,
++                bottom_oil=bottom_oil,
++                hot_spot_factor=hot_spot_factor,
++                winding_temperature_gradient=winding_temperature_gradient,
++                winding_exponent=winding_exponent
++            )
++            ht.get_hot_spot()
++
++    def test_OD_with_BOT(self):
++        apparent_power = 21.9101963934603
++        rated_power = 630
++        cooling = TransformerCoolingMethods.od
++        ambient_temperature = 36.92
++        top_oil = 52.02
++        bottom_oil = 41.08
++        hot_spot_factor = 1.1
++        winding_temperature_gradient = 21
++        winding_exponent = 1.6
++        with self.assertRaises(NotImplementedError):
++            ht = HotSpot(
++                apparent_power=apparent_power,
++                rated_power=rated_power,
++                cooling=cooling,
++                ambient_temperature=ambient_temperature,
++                top_oil=top_oil,
++                bottom_oil=bottom_oil,
++                hot_spot_factor=hot_spot_factor,
++                winding_temperature_gradient=winding_temperature_gradient,
++                winding_exponent=winding_exponent
++            )
++            ht.get_hot_spot()
++
++    @mock.patch('data_log.utils.HotSpot._oil_directed_hot_spot_without_bot')
++    @mock.patch('data_log.utils.HotSpot._oil_directed_hot_spot_with_bot')
++    @mock.patch('data_log.utils.HotSpot._oil_forced_hot_spot_without_bot')
++    @mock.patch('data_log.utils.HotSpot._oil_forced_hot_spot_with_bot')
++    @mock.patch('data_log.utils.HotSpot._oil_natural_hot_spot_without_bot')
++    @mock.patch('data_log.utils.HotSpot._oil_natural_hot_spot_with_bot')
++    def test_dispatch(self, on_w_bot, on_wout_bot, of_w_bot, of_wout_bot, od_w_bot, od_wout_bot):
++        cases = [
++            {
++                'params': {
++                    'apparent_power': 630,
++                    'rated_power': 630,
++                    'cooling': TransformerCoolingMethods.on,
++                    'ambient_temperature': 40,
++                    'top_oil': 50,
++                    'bottom_oil': 30,
++                    'hot_spot_factor': 1.1,
++                    'winding_temperature_gradient': 23,
++                    'winding_exponent': 1.6
++                },
++                'call': on_w_bot
++            },
++            {
++                'params': {
++                    'apparent_power': 630,
++                    'rated_power': 630,
++                    'cooling': TransformerCoolingMethods.on,
++                    'ambient_temperature': 40,
++                    'top_oil': 50,
++                    'bottom_oil': None,
++                    'hot_spot_factor': 1.1,
++                    'winding_temperature_gradient': 23,
++                    'winding_exponent': 1.6
++                },
++                'call': on_wout_bot
++            },
++            {
++                'params': {
++                    'apparent_power': 630,
++                    'rated_power': 630,
++                    'cooling': TransformerCoolingMethods.of,
++                    'ambient_temperature': 40,
++                    'top_oil': 50,
++                    'bottom_oil': 30,
++                    'hot_spot_factor': 1.1,
++                    'winding_temperature_gradient': 23,
++                    'winding_exponent': 1.6
++                },
++                'call': of_w_bot
++            },
++            {
++                'params': {
++                    'apparent_power': 630,
++                    'rated_power': 630,
++                    'cooling': TransformerCoolingMethods.of,
++                    'ambient_temperature': 40,
++                    'top_oil': 50,
++                    'bottom_oil': None,
++                    'hot_spot_factor': 1.1,
++                    'winding_temperature_gradient': 23,
++                    'winding_exponent': 1.6
++                },
++                'call': of_wout_bot
++            },
++            {
++                'params': {
++                    'apparent_power': 630,
++                    'rated_power': 630,
++                    'cooling': TransformerCoolingMethods.od,
++                    'ambient_temperature': 40,
++                    'top_oil': 50,
++                    'bottom_oil': 15.5,
++                    'hot_spot_factor': 1.1,
++                    'winding_temperature_gradient': 23,
++                    'winding_exponent': 1.6
++                },
++                'call': od_w_bot
++            },
++            {
++                'params': {
++                    'apparent_power': 630,
++                    'rated_power': 630,
++                    'cooling': TransformerCoolingMethods.od,
++                    'ambient_temperature': 40,
++                    'top_oil': 50,
++                    'bottom_oil': None,
++                    'hot_spot_factor': 1.1,
++                    'winding_temperature_gradient': 23,
++                    'winding_exponent': 1.6
++                },
++                'call': od_wout_bot
++            },
++        ]
++        for case in cases:
++            ht = HotSpot(**case['params'])
++            ht.get_hot_spot()
++            case['call'].assert_called_with()
++
++    def test_hot_spot_value(self):
++        self.factory = RequestFactory()
++        c = Config.create()
++        c.rtd.filter(number=1).update(name='(TO)')
++        c.rtd.filter(number=2).update(name='(BO)')
++        dev = Device.create(config=c)
++        trans = Transformer.create(cooling=TransformerCoolingMethods.on, winding_exponent=1.6, winding_temperature_gradient=23,
++                                   hot_spot_factor=1.1, load_rating=630)
++        Site.create(device=dev, transformer=trans)
++        t = timezone.now()
++        report = copy.deepcopy(report_valid)
++        report['data'][0]['AVGT'] = {
++            'RTD1': 5202,
++            'RTD2': 4108,
++            'RTD3': 0,
++            'RTD4': 0,
++            'AT': 3692
++        }
++        report['data'][0]['AVGE']['Pa'] = 21910
++        report['data'][0]['AVGE']['Pb'] = 0
++        report['data'][0]['AVGE']['Pc'] = 0
++        report['data'][0]['AVGE']['Qa'] = 0
++        report['data'][0]['AVGE']['Qb'] = 0
++        report['data'][0]['AVGE']['Qc'] = 0
++        report['data'][0]['ts'] = str(t)
++        report['params']['DEV']['sn'] = dev.serial_number
++        request = self.factory.post('/reports', json.dumps(report), content_type="Application/json")
++        force_authenticate(request, user=dev.user)
++        create_report(request)
++        self.assertEqual(DataLog.objects.last().st, 21.91)
++        self.assertEqual(round(DataLog.objects.last().hot_spot_temperature, 7), 52.9076745)
++
++    def test_hot_spot_value_without_params(self):
++        self.factory = RequestFactory()
++        c = Config.create()
++        c.rtd.filter(number=1).update(name='(TO)')
++        c.rtd.filter(number=2).update(name='(BO)')
++        dev = Device.create(config=c)
++        trans = Transformer.create(cooling=TransformerCoolingMethods.on, load_rating=630)
++        Site.create(device=dev, transformer=trans)
++        t = timezone.now()
++        report = copy.deepcopy(report_valid)
++        report['data'][0]['AVGT'] = {
++            'RTD1': 5202,
++            'RTD2': 4108,
++            'RTD3': 0,
++            'RTD4': 0,
++            'AT': 3692
++        }
++        report['data'][0]['AVGE']['Pa'] = 21910
++        report['data'][0]['AVGE']['Pb'] = 0
++        report['data'][0]['AVGE']['Pc'] = 0
++        report['data'][0]['AVGE']['Qa'] = 0
++        report['data'][0]['AVGE']['Qb'] = 0
++        report['data'][0]['AVGE']['Qc'] = 0
++        report['data'][0]['ts'] = str(t)
++        report['params']['DEV']['sn'] = dev.serial_number
++        request = self.factory.post('/reports', json.dumps(report), content_type="Application/json")
++        force_authenticate(request, user=dev.user)
++        create_report(request)
++        self.assertEqual(DataLog.objects.last().st, 21.91)
++        self.assertEqual(round(DataLog.objects.last().hot_spot_temperature, 7), 52.8974767)
+diff --git a/src/data_log/tests/test_views.py b/src/data_log/tests/test_views.py
+index 7756e14b..9e182370 100644
+--- a/src/data_log/tests/test_views.py
++++ b/src/data_log/tests/test_views.py
+@@ -37,6 +37,7 @@ class DataLogAccess(TestCase):
+         ip = '192.168.1.1'
+         self.customer = Customer.create(timezone=0)
+         self.config = Config.create(customer=self.customer)
++        self.config.rtd.filter(number=1).update(name='(TO)')
+         self.dev1 = Device.create(serial_number="1234", customer=self.customer, config=self.config)
+         self.dev2 = Device.create(serial_number="2345", customer=self.customer, config=self.config)
+         self.dev3 = Device.create(serial_number="3456", customer=self.customer, config=self.config)
+@@ -497,6 +498,7 @@ class UtilsTest(TestCase):
+                     'rtd2_enable': True,
+                     'rtd3_enable': True,
+                     'rtd4_enable': True,
++                    'transformer_monitoring': True,
+                     'device__type': DeviceType.meter
+                 }
+             }, 'config_all_fields'),
+@@ -509,6 +511,7 @@ class UtilsTest(TestCase):
+                     'rtd2_enable': False,
+                     'rtd3_enable': True,
+                     'rtd4_enable': True,
++                    'transformer_monitoring': True,
+                     'device__type': DeviceType.meter
+                 }
+             }, 'config_all_except_rtd2'),
+@@ -521,6 +524,7 @@ class UtilsTest(TestCase):
+                     'rtd2_enable': False,
+                     'rtd3_enable': False,
+                     'rtd4_enable': False,
++                    'transformer_monitoring': True,
+                     'device__type': DeviceType.meter
+                 }
+             }, 'config_no_temperature_fields'),
+@@ -533,6 +537,7 @@ class UtilsTest(TestCase):
+                     'rtd2_enable': True,
+                     'rtd3_enable': True,
+                     'rtd4_enable': True,
++                    'transformer_monitoring': True,
+                     'device__type': DeviceType.meter
+                 }
+             }, 'config_3_phase_3_wire'),
+@@ -545,6 +550,7 @@ class UtilsTest(TestCase):
+                     'rtd2_enable': False,
+                     'rtd3_enable': False,
+                     'rtd4_enable': False,
++                    'transformer_monitoring': True,
+                     'device__type': DeviceType.meter
+                 }
+             }, 'not temperature and 3 phase 3 wire'),
+@@ -557,6 +563,7 @@ class UtilsTest(TestCase):
+                     'rtd2_enable': False,
+                     'rtd3_enable': False,
+                     'rtd4_enable': False,
++                    'transformer_monitoring': True,
+                     'device__type': DeviceType.dual_meter
+                 }
+             }, 'device dual meter'),
+diff --git a/src/data_log/tests/views_test_cases.py b/src/data_log/tests/views_test_cases.py
+index 0548a90d..2d9397d6 100644
+--- a/src/data_log/tests/views_test_cases.py
++++ b/src/data_log/tests/views_test_cases.py
+@@ -35,10 +35,10 @@ expected_response = {
+ 
+ all_fields = ['va', 'vb', 'vc', 'uab', 'ubc', 'uca', 'ia', 'ib', 'ic', 'ires', 'pa', 'pb', 'pc', 'pt', 'qa', 'qb', 'qc',
+               'qt', 'sa', 'sb', 'sc', 'st', 'pfa', 'pfb', 'pfc', 'pft', 'thda', 'thdb', 'thdc', 'freq', 'rtd1', 'rtd2',
+-              'rtd3', 'rtd4', 'at', ]
++              'rtd3', 'rtd4', 'at',  'hot_spot_temperature']
+ 
+ fields_wiring_type_3p = ['uab', 'ubc', 'uca', 'ia', 'ic', 'pa', 'pc', 'pt', 'qa', 'qc', 'qt', 'st', 'pft', 'thda', 'thdc', 'freq', 'rtd1',
+-                         'rtd2', 'rtd3', 'rtd4', 'at']
++                         'rtd2', 'rtd3', 'rtd4', 'at', 'hot_spot_temperature']
+ 
+ last_measurement_all_fields = all_fields + ['timestamp']
+ last_measurements_fields_wiring_type_3p = fields_wiring_type_3p + ['timestamp']
+diff --git a/src/data_log/utils.py b/src/data_log/utils.py
+index 2e9b2a03..4ffb0f79 100644
+--- a/src/data_log/utils.py
++++ b/src/data_log/utils.py
+@@ -12,7 +12,7 @@ from device_configuration.enum import WiringType
+ from device_configuration.models import Config
+ from devices.enum import DeviceType
+ from stats.utils import get_time_intervals
+-from transformers.enum import SiteType
++from transformers.enum import SiteType, TransformerCoolingMethods
+ from .static_data.mappings import LOGGABLE_PARAMS, DATABASE_MAPPING, rtd, ambient_temperature
+ from device_configuration.static_data import params as config_params
+ from static_data.params import PARAMS
+@@ -413,7 +413,7 @@ def get_last_measurement_fields_metadata(sites, params, interface):
+             except ValueError as e:
+                 logger.warning(msg='RTD NOT FOUND: config id = ' + str(configs[0].id) + ', error is :' + str(e))
+         if category == ambient_temperature and not configs[0].at_enable:
+-            return {}
++            data[param] = {}
+ 
+     return data
+ 
+@@ -515,6 +515,12 @@ def get_unbalance(values):
+     return max(abs(100*(value-avg)/avg) for value in values)
+ 
+ 
++def get_efficiency(total_active_power, loss):
++    if total_active_power and loss is not None:
++        return 100 * total_active_power / (total_active_power + loss)
++    return None
++
++
+ def set_data_log_calculable_values(data_log):
+     """
+     Calculates some values to be added to the data log
+@@ -543,13 +549,40 @@ def set_data_log_calculable_values(data_log):
+             data_log.voltage_unbalance = get_unbalance([data_log.uab, data_log.ubc, data_log.uca])
+     if data_log.device.site.type == SiteType.measurement_point or data_log.device.type == DeviceType.dual_meter:
+         return data_log
+-    load_rating = data_log.device.site.transformer.load_rating
+-    load_loss = data_log.device.site.transformer.load_loss
+-    no_load_loss = data_log.device.site.transformer.no_load_loss
++    transformer = data_log.device.site.transformer
++    load_rating = transformer.load_rating
++    load_loss = transformer.load_loss
++    no_load_loss = transformer.no_load_loss
+     losses = get_losses(data_log, load_loss, no_load_loss, load_rating)
+     data_log.loss = losses['total_loss']
+     data_log.i2r_loss = losses['i2r_loss']
+     data_log.pec_loss = losses['pec_loss']
++    data_log.efficiency = get_efficiency(data_log.pt, data_log.loss)
++    if config:
++        top_oil_rtd = config.rtd.filter(name__icontains='(to)')
++        bottom_oil_rtd = config.rtd.filter(name__icontains='(bo)')
++        if top_oil_rtd.exists():
++            top_oil = getattr(data_log, 'rtd' + str(top_oil_rtd.first().number))
++            try:
++                bottom_oil = getattr(data_log, 'rtd' + str(bottom_oil_rtd.first().number))
++            except:
++                bottom_oil = None
++            try:
++                hot_spot = HotSpot(
++                    apparent_power=data_log.st,
++                    rated_power=load_rating,
++                    cooling=transformer.cooling,
++                    ambient_temperature=data_log.at,
++                    top_oil=top_oil,
++                    bottom_oil=bottom_oil,
++                    hot_spot_factor=transformer.hot_spot_factor,
++                    winding_exponent=transformer.winding_exponent,
++                    winding_temperature_gradient=transformer.winding_temperature_gradient
++                )
++                hst = hot_spot.get_hot_spot()
++                data_log.hot_spot_temperature = hst
++            except:
++                pass
+     return data_log
+ 
+ 
+@@ -680,7 +713,8 @@ def get_config_fields_params(interface, sites):
+         'rtd3_enable': min(rtds.filter(number=3).values_list('enable', flat=True)),
+         'rtd4_enable': min(rtds.filter(number=4).values_list('enable', flat=True)),
+         'device__type': DeviceType.meter if list(sites.values_list('device__type',
+-                                                                   flat=True).distinct()) == [DeviceType.meter] else DeviceType.dual_meter
++                                                                   flat=True).distinct()) == [DeviceType.meter] else DeviceType.dual_meter,
++        'transformer_monitoring': sites.filter(type=SiteType.transformer_monitoring).exists()
+     }
+ 
+ 
+@@ -715,3 +749,128 @@ def get_sites_last_measurements_timestamp(sites, interface):
+                      .filter(count_ts=sites.count())\
+                      .aggregate(t=Max('timestamp'))['t']
+     return ts
++
++
++class HotSpot:
++
++    def __init__(self, apparent_power, rated_power, ambient_temperature, top_oil, cooling=TransformerCoolingMethods.on, bottom_oil=None,
++                 hot_spot_factor=None, winding_temperature_gradient=None, winding_exponent=None):
++        """
++        Calculate the hot spot for a transformer.
++
++        Args:
++            apparent_power: total apparent power
++            rated_power: transformer load rating
++            cooling: the transformer cooling method
++            ambient_temperature: ambient temperature
++            top_oil: top oil temperature
++            bottom_oil: bottom oil temperature
++            hot_spot_factor(H):
++            winding_temperature_gradient(gr):
++            winding_exponent(y):
++
++        Returns:
++            the hto spot value.
++        """
++        self.cooling = TransformerCoolingMethods.on if not cooling else cooling
++        self.st = apparent_power
++        self.s_rated = rated_power
++        self.ambient_temperature = ambient_temperature
++        self.top_oil = top_oil
++        self.bottom_oil = bottom_oil
++        self.h = self.hot_spot_factor(hot_spot_factor)
++        self.gr = self.winding_temperature_gradient(winding_temperature_gradient)
++        self.y = self.winding_exponent(winding_exponent)
++        self.k = self.st/self.s_rated
++        self.k_pow = self.k ** self.y
++        self.delta_spot = self.k_pow * self.h * self.gr
++
++    def hot_spot_factor(self, hot_spot_factor):
++        if not hot_spot_factor:
++            hot_spot_factor = TransformerCoolingMethods.hot_spot_factor(self.cooling, self.s_rated)
++        return hot_spot_factor
++
++    def winding_temperature_gradient(self, winding_temperature_gradient):
++        if not winding_temperature_gradient:
++            winding_temperature_gradient = TransformerCoolingMethods.winding_temperature_gradient(self.cooling, self.s_rated)
++        return winding_temperature_gradient
++
++    def winding_exponent(self, winding_exponent):
++        if not winding_exponent:
++            winding_exponent = TransformerCoolingMethods.winding_exponent(self.cooling)
++        return winding_exponent
++
++    def get_hot_spot(self):
++        """
++        get the hot spot calculator.
++        it depends on the cooling method and weather the bottom oil value was provided or not.
++
++        Returns:
++            the hot spot temperature value.
++
++        """
++        bot = 'with' if self.bottom_oil else 'without'
++        method = '_{}_hot_spot_{}_bot'.format(self.cooling, bot)
++        return getattr(self, method)()
++
++    def _oil_natural_hot_spot_without_bot(self):
++        """
++        Calculate hot spot value when
++            the cooling type is ON
++            there is NO bottom oil temperature
++        Returns:
++            hot spot temperature
++        """
++        top_oil_correction = ((self.top_oil - self.ambient_temperature) / 1.25) / 12.5
++        return self.top_oil + self.delta_spot + top_oil_correction
++
++    def _oil_natural_hot_spot_with_bot(self):
++        """
++        Calculate hot spot value when:
++            the cooling type is ON
++            there is bottom oil temperature
++        Returns:
++            hot spot temperature
++        """
++        top_oil_correction = (0.5 * (self.top_oil + self.bottom_oil) - self.ambient_temperature) / 12.5
++        return self.top_oil + self.delta_spot + top_oil_correction
++
++    def _oil_forced_hot_spot_without_bot(self):
++        """
++        Calculate hot spot value when:
++            the cooling type is OF
++            there is NO bottom oil temperature
++        Returns:
++            hot spot temperature
++        """
++        raise NotImplementedError
++
++    def _oil_forced_hot_spot_with_bot(self):
++        """
++        Calculate hot spot value when:
++            the cooling type is OF
++            there is bottom oil temperature
++        Returns:
++            hot spot temperature
++        """
++        raise NotImplementedError
++
++    def _oil_directed_hot_spot_without_bot(self):
++        """
++        Calculate hot spot value when:
++            the cooling type is OD
++            there is no bottom oil temperature
++        Returns:
++            hot spot temperature
++        """
++        raise NotImplementedError
++
++    def _oil_directed_hot_spot_with_bot(self):
++        """
++        Calculate hot spot value when:
++            the cooling type is OD
++            there is bottom oit temperature
++        Returns:
++            hot spot temperature
++        """
++        raise NotImplementedError
+diff --git a/src/data_log/views.py b/src/data_log/views.py
+index 767b6ca8..8f3b3f00 100644
+--- a/src/data_log/views.py
++++ b/src/data_log/views.py
+@@ -8,6 +8,7 @@ import rest_framework_filters as filters
+ 
+ from data_log.enum import Interface
+ from data_log.serializers import DataLogSerializer, DataLogDetailsSerializer
++from data_log.tasks import update_efficiency
+ from data_log.utils import get_data_log_params, historical_measurements, last_measurement, get_energy, export_data_log_to_admin, \
+     get_fields, \
+     get_config_fields_params, get_sites_last_measurements_timestamp
+@@ -139,8 +140,8 @@ class GetHistoricalMeasurements(SiteWithMetering, GenericView):
+         else:
+             data_mtr1 = {}
+             time_mtr1 = []
+-        data, time = historical_measurements(start_date=start_date, end_date=end_date, sites=sites, fields=params, interface=interface)
+ 
++        data, time = historical_measurements(start_date=start_date, end_date=end_date, sites=sites, fields=params, interface=interface)
+         if not data and not data_mtr1:
+             return Response({'details': 'Not data found'}, status=204)
+         else:
+@@ -175,7 +176,6 @@ class GetLastMeasurement(SiteWithMetering, GenericView):
+             params = get_fields(view=view, params=get_config_fields_params(interface=interface, sites=sites))
+         except ValueError:
+             return Response({'details': 'All sites devices need to be configured'}, status=204)
+-
+         last_measurements_ts = get_sites_last_measurements_timestamp(sites=sites, interface=interface)
+         if not last_measurements_ts:
+             return Response({'details': 'No data found with a valid timestamp for this request'}, status=204)
+@@ -261,3 +261,8 @@ def get_device_last_measurement_log(request, pk):
+         return get_measurements_log_by_id(request, data_logs.latest('timestamp').id, refresh=True)
+     else:
+         raise Http404
++
++
++def update_site_efficiency(request, site_id):
++    update_efficiency.delay(site_id)
++    return redirect('/admin/transformers/site/',)
+diff --git a/src/device_configuration/schema.py b/src/device_configuration/schema.py
+index 74891891..136351a6 100644
+--- a/src/device_configuration/schema.py
++++ b/src/device_configuration/schema.py
+@@ -1,7 +1,8 @@
+ import graphene
+ from graphene_django.types import DjangoObjectType
+ 
+-from .models import Config, Input
++from utils.access import limit_queryset_access
++from .models import Config, Input, Output, RTD, ScheduledTask
+ 
+ 
+ class InputGraph(DjangoObjectType):
+@@ -9,6 +10,21 @@ class InputGraph(DjangoObjectType):
+         model = Input
+ 
+ 
++class OutputGraph(DjangoObjectType):
++    class Meta:
++        model = Output
++
++
++class RTDGraph(DjangoObjectType):
++    class Meta:
++        model = RTD
++
++
++class ScheduledTaskGraph(DjangoObjectType):
++    class Meta:
++        model = ScheduledTask
++
++
+ class ConfigGraph(DjangoObjectType):
+     class Meta:
+         model = Config
+@@ -17,9 +33,12 @@ class ConfigGraph(DjangoObjectType):
+ class Query(graphene.AbstractType):
+     device_config = graphene.Field(ConfigGraph, id=graphene.Int())
+     inputs = graphene.Field(InputGraph)
++    outputs = graphene.Field(OutputGraph)
++    rtd = graphene.Field(RTDGraph)
++    scheduled_task = graphene.Field(ScheduledTaskGraph)
+ 
+     def resolve_device_config(self, info, **kwargs):
+         device_config_id = kwargs.get('id')
+         if device_config_id is None:
+             return
+-        return Config.objects.filter(group__in=info.context.user.customeruser.get_groups()).distinct().get(id=device_config_id)
++        return limit_queryset_access(Config.objects.all(), info).get(id=device_config_id)
+diff --git a/src/device_firmwares/admin.py b/src/device_firmwares/admin.py
+index cd986954..de6f8ea8 100644
+--- a/src/device_firmwares/admin.py
++++ b/src/device_firmwares/admin.py
+@@ -9,7 +9,6 @@ from .models import Firmware
+ class FirmwareAdmin(admin.ModelAdmin):
+     form = ProductForm
+     list_display = ('id', 'get_version', 'description', 'creation_date', 'get_action')
+-    ordering = ('-creation_date',)
+     search_fields = ('id', 'description',)
+     fields = ('major_version', 'minor_version', 'patch_version', 'file', 'description', 'feature')
+     list_filter = ('major_version', 'minor_version')
+diff --git a/src/devices/admin.py b/src/devices/admin.py
+index 361b708e..df901926 100644
+--- a/src/devices/admin.py
++++ b/src/devices/admin.py
+@@ -10,7 +10,7 @@ from import_export.fields import Field
+ from devices.enum import ConnectivityError
+ from devices.models import Device, ConnectionRequest
+ from devices.utils import get_version
+-from utils.admin import ExportMixin
++from utils.admin import ExportMixin, AdminItemsPerPage
+ 
+ 
+ class Export(resources.ModelResource):
+@@ -55,12 +55,11 @@ class ConnectivityFilter(admin.SimpleListFilter):
+             return queryset
+ 
+ 
+-class DeviceAdmin(ExportMixin, admin.ModelAdmin):
++class DeviceAdmin(AdminItemsPerPage, ExportMixin, admin.ModelAdmin):
+     # export
+     resource_class = Export
+     # display
+-    ordering = ('-creation_date',)
+-    fields = ('customer', 'type', 'serial_number', 'config', 'ip_address')
++    fields = ('customer', 'type', 'serial_number', 'config', 'ip_address', 'ems_id')
+     actions = ['factory_reset_action', 'reboot_action', 'firmware_upgrade_action', 'get_cmd_action', 'set_cmd_action']
+     search_fields = ('serial_number',)
+     list_filter = ('customer', 'type', 'config_status', ConnectivityFilter, 'network_interface')
+@@ -72,7 +71,7 @@ class DeviceAdmin(ExportMixin, admin.ModelAdmin):
+         Tries to locate the firmware from the database, if it exists it will show the software version with the link
+         """
+         from device_firmwares.models import Firmware
+-        if device.software_version is None:
++        if not device.software_version:
+             return _('Unknown')
+         major_ver, minor_ver, patch_ver = get_version(device.software_version)
+         firmware = Firmware.objects.filter(major_version=major_ver, minor_version=minor_ver, patch_version=patch_ver)
+@@ -196,7 +195,7 @@ class DeviceAdmin(ExportMixin, admin.ModelAdmin):
+         }
+ 
+ 
+-class ConnectionRequestAdmin(admin.ModelAdmin):
++class ConnectionRequestAdmin(AdminItemsPerPage, admin.ModelAdmin):
+     fields = ('device', 'status')
+     list_display = ('device', 'status', 'error', 'creation_date')
+ 
+diff --git a/src/devices/migrations/0015_device_ems_id.py b/src/devices/migrations/0015_device_ems_id.py
+new file mode 100644
+index 00000000..81060336
+--- /dev/null
++++ b/src/devices/migrations/0015_device_ems_id.py
+@@ -0,0 +1,19 @@
++# -*- coding: utf-8 -*-
++from __future__ import unicode_literals
++
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('devices', '0014_add_outputs'),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name='device',
++            name='ems_id',
++            field=models.PositiveIntegerField(verbose_name='EMS ID', null=True, blank=True),
++        ),
++    ]
+diff --git a/src/devices/models.py b/src/devices/models.py
+index ed539898..f22ca2c1 100644
+--- a/src/devices/models.py
++++ b/src/devices/models.py
+@@ -1,11 +1,12 @@
++from functools import partialmethod
+ import json
+ from datetime import timedelta
+-from django.utils import timezone
+ 
+ from django.db.models import PROTECT, Q
+ from django.db.models.signals import post_save, post_delete, pre_save
+ from django.dispatch import receiver
+ from django.utils.translation import ugettext_lazy as _
++from django.utils import timezone
+ from django.db import models
+ from django.contrib.auth.models import User
+ from django.core.exceptions import ValidationError
+@@ -53,6 +54,7 @@ class Device(DirtyFieldsMixin, models.Model):
+     network_interface = models.PositiveSmallIntegerField(verbose_name=_('Active network interface'), default=NetworkInterface.undefined,
+                                                          choices=NetworkInterface.iterable_choices())
+     ip_address = models.GenericIPAddressField(verbose_name=_('Ip address'), blank=True, null=True)
++    ems_id = models.PositiveIntegerField(verbose_name=_('EMS ID'), null=True, blank=True)
+ 
+     def __str__(self):
+         return self.serial_number
+@@ -249,6 +251,21 @@ class Device(DirtyFieldsMixin, models.Model):
+         dev_input = self.config.input.get(number=nbr)
+         return dev_input.enable and dev_input.type == InputType.pulse_counter
+ 
++    def set_config_status(self, state):
++        """
++        Update device config state
++        Args:
++            state: the new device state
++
++        """
++        self.config_status = state
++        self.save()
++
++    set_config_up_to_date = partialmethod(set_config_status, DeviceConfigStatus.up_date)
++    set_config_not_up_to_date = partialmethod(set_config_status, DeviceConfigStatus.not_up_date)
++    set_config_error = partialmethod(set_config_status, DeviceConfigStatus.error)
++    set_config_in_progress = partialmethod(set_config_status, DeviceConfigStatus.in_progress)
++
+ 
+ @receiver(pre_save, sender=Device)
+ def update_user(sender, instance, **kwargs):
+diff --git a/src/devices/schema.py b/src/devices/schema.py
+index cbd2f40f..a82446e9 100644
+--- a/src/devices/schema.py
++++ b/src/devices/schema.py
+@@ -1,6 +1,7 @@
+ import graphene
+ from graphene_django.types import DjangoObjectType
+ 
++from utils.access import limit_queryset_access
+ from .models import Device
+ from .serializers import get_config_status_as_dict
+ from transformers.schema import groupGraph
+@@ -26,12 +27,10 @@ class Query(graphene.AbstractType):
+     device = graphene.Field(DeviceGraph, id=graphene.Int())
+ 
+     def resolve_all_devices(self, info, **kwargs):
+-        return Device.objects.filter(group__in=info.context.user.customeruser.get_groups())
++        return limit_queryset_access(Device.objects.all(), info)
+ 
+     def resolve_device(self, info, **kwargs):
+         device_id = kwargs.get('id')
+         if device_id is None:
+             return
+-        return Device.objects.filter(group__in=info.context.user.customeruser.get_groups())\
+-                             .distinct()\
+-                             .get(id=device_id)
++        return limit_queryset_access(Device.objects.all(), info).get(id=device_id)
+diff --git a/src/devices/tests/test_models.py b/src/devices/tests/test_models.py
+index 800b355e..e9fcc8e0 100644
+--- a/src/devices/tests/test_models.py
++++ b/src/devices/tests/test_models.py
+@@ -12,12 +12,12 @@ from commands_handler.enum import CommandStatus
+ from commands_handler.models import Command
+ from customers.models import Customer
+ from device_configuration.models import Config
+-from devices.enum import OutputStatus, DeviceType, ConnectionRequestStatus, OutputError
++from devices.enum import OutputStatus, DeviceType, ConnectionRequestStatus, OutputError, DeviceConfigStatus
+ from devices.models import Device, ConnectionRequest
+ from devices.tests.device_model_test_cases import connectivity
+ from events.enum import EventState
+ from events.models import Event
+-from static_data.events import DigitalOutput
++from static_data.events import DigitalOutput, System
+ from transformers.models import Site
+ from devices.tasks import send_connection_request, check_output_progress
+ 
+@@ -237,3 +237,13 @@ class ConnectionRequestTest(TestCase):
+         send_connection_request(self.dev.id)
+         conn.refresh_from_db()
+         self.assertEqual(conn.status, ConnectionRequestStatus.error)
++
++
++class TestStatusUpdate(TestCase):
++
++    def test_hard_reset_updates_device_config_status(self):
++        event_type = System.HARD_RESET
++        d = Device.create(config_status=DeviceConfigStatus.up_date)
++        Event.create(type=event_type, device=d)
++        d.refresh_from_db()
++        self.assertEqual(d.config_status, DeviceConfigStatus.not_up_date)
+diff --git a/src/devices/views.py b/src/devices/views.py
+index 90f4eed1..ee136cc4 100644
+--- a/src/devices/views.py
++++ b/src/devices/views.py
+@@ -19,6 +19,7 @@ from rest_framework import status as http_status
+ from device_firmwares.models import Firmware
+ from commands_handler.utils import firmware_upgrade_devices, reboot_devices, factory_reset_devices
+ from devices.utils import get_device_outputs, set_device_outputs
++from events.enum import EventState
+ from transformers.mixins import FilterViewByGroupMixin, GroupOptionsAsTree
+ from users_management.enum import CustomerUserRoles
+ from utils.access import auth_user_to_object, get_customer_by_user
+@@ -302,11 +303,11 @@ def get_device_report_data(request):
+         rt_enabled = 0 if device.config.enable_rt is False else 1
+     else:
+         rt_enabled = 0
+-
+     # events
+-    # from events.models import Event
+-    device_events = device.event_set.filter(timestamp__gte=start_date, timestamp__lt=end_date).values('type').annotate(Count('type')),
+-    # device_events = Event.objects.all().values('type').annotate(Count('type')),
++    device_events = device.event_set.filter(timestamp__gte=start_date,
++                                            timestamp__lt=end_date,
++                                            state__in=[EventState.begin, EventState.none])\
++                                    .values('type').annotate(Count('type')),
+ 
+     def get_event_type_count(events_list, event_type):
+         try:
+diff --git a/src/energy_cost/schema.py b/src/energy_cost/schema.py
+new file mode 100644
+index 00000000..be9867f0
+--- /dev/null
++++ b/src/energy_cost/schema.py
+@@ -0,0 +1,43 @@
++import graphene
++from graphene_django.types import DjangoObjectType
++
++from .models import Calendar, Rate, Cost, DayType, DayTypeRange, CalendarWeekType, EnergyTimeSlot
++
++
++class CalendarGraph(DjangoObjectType):
++    class Meta:
++        model = Calendar
++
++
++class RateGraph(DjangoObjectType):
++    class Meta:
++        model = Rate
++
++
++class CostGraph(DjangoObjectType):
++    class Meta:
++        model = Cost
++
++
++class DayTypeGraph(DjangoObjectType):
++    class Meta:
++        model = DayType
++
++
++class DayTypeRangeGraph(DjangoObjectType):
++    class Meta:
++        model = DayTypeRange
++
++
++class CalendarWeekTypeGraph(DjangoObjectType):
++    class Meta:
++        model = CalendarWeekType
++
++
++class EnergyTimeSlotGraph(DjangoObjectType):
++    class Meta:
++        model = EnergyTimeSlot
++
++
++class Query(graphene.AbstractType):
++    calendar = graphene.Field(CalendarGraph)
+diff --git a/src/energy_cost/serializers/consumption_level_cost.py b/src/energy_cost/serializers/consumption_level_cost.py
+index 8f3d1abb..d3a1098c 100644
+--- a/src/energy_cost/serializers/consumption_level_cost.py
++++ b/src/energy_cost/serializers/consumption_level_cost.py
+@@ -5,6 +5,7 @@ from energy_cost import models
+ from energy_cost.enum import ScaledCostModes, CalendarTypes
+ from energy_cost.models import ScaledCost
+ from transformers.mixins import GroupManagementMixin
++from transformers.models import Group
+ from utils.serializers import CustomWriteSerializer
+ 
+ 
+@@ -42,9 +43,10 @@ class ConsumptionLevelSerializer(GroupManagementMixin, serializers.ModelSerializ
+ class ConsumptionLevelWriteSerializer(GroupManagementMixin, CustomWriteSerializer):
+     groups_manager_name = 'costs_group'
+     costs = ScaledCostWriteSerializer(many=True, required=True, source='scaledcost_set')
++    groups = serializers.PrimaryKeyRelatedField(many=True, queryset=Group.objects.all(), required=False, source=groups_manager_name)
+ 
+     class Meta:
+-        fields = ('id', 'name', 'type', 'customer', 'costs')
++        fields = ('id', 'name', 'type', 'customer', 'costs', 'groups')
+         model = models.Calendar
+ 
+     def to_representation(self, instance):
+diff --git a/src/events/admin.py b/src/events/admin.py
+index eecc1b3b..b87d5de2 100644
+--- a/src/events/admin.py
++++ b/src/events/admin.py
+@@ -1,5 +1,5 @@
+ from django.contrib import admin
+-from django.forms import ModelForm
++from django.forms import ModelForm, NumberInput
+ from django.utils.translation import ugettext_lazy as _
+ from daterange_filter.filter import DateRangeFilter
+ from import_export import resources
+@@ -8,7 +8,8 @@ from suit.widgets import SuitSplitDateTimeWidget
+ 
+ from events.enum import EventState
+ from events.models import Event
+-from utils.admin import get_device, ExportMixin
++from utils.admin import ExportMixin, DeviceSearch, LargeQueryChangeList, AdminItemsPerPage
++from utils.pagination import LargeTablePaginator
+ 
+ 
+ class StateFilter(admin.SimpleListFilter):
+@@ -28,6 +29,7 @@ class EventModelForm(ModelForm):
+     class Meta:
+         widgets = {
+             'timestamp': SuitSplitDateTimeWidget,
++            'report': NumberInput,
+         }
+ 
+ 
+@@ -41,18 +43,20 @@ class EventExport(resources.ModelResource):
+         export_order = fields
+ 
+ 
+-class EventAdmin(ExportMixin, admin.ModelAdmin):
++class EventAdmin(AdminItemsPerPage, DeviceSearch, ExportMixin, admin.ModelAdmin):
++    paginator = LargeTablePaginator
+     resource_class = EventExport
+     form = EventModelForm
+-    list_display = ('id', 'type', 'timestamp', get_device, 'get_report', 'get_state')
++    list_display = ('id', 'type', 'timestamp', 'device', 'get_report', 'get_state')
+     list_filter = ('type', StateFilter, ('timestamp', DateRangeFilter))
+-    ordering = ('-timestamp',)
+     search_fields = ('device__serial_number',)
+     list_display_links = None
+ 
+-    get_device.allow_tags = True
+-    get_device.short_description = _('Device Serial Number')
+-    get_device.admin_order_field = 'device__serial_number'
++    def get_changelist(self, request, **kwargs):
++        """
++        Returns the ChangeList class for use on the changelist page.
++        """
++        return LargeQueryChangeList
+ 
+     def get_report(self, event):
+         report = event.report
+diff --git a/src/events/models.py b/src/events/models.py
+index db934518..40a8ffc3 100644
+--- a/src/events/models.py
++++ b/src/events/models.py
+@@ -8,7 +8,7 @@ from events.enum import EventState
+ from power_quality.models import VoltageQuality
+ from reports.models import Report
+ from settings.settings import EVENT_STATE_LENGTH
+-from static_data.events import EVENTS
++from static_data.events import EVENTS, System
+ 
+ types = ((event['type'], _(event['name'])) for event in EVENTS)
+ types = tuple(types)
+@@ -59,3 +59,5 @@ def parse_event(sender, instance, created, **kwargs):
+         VoltageQuality.create_voltage_quality(instance)
+     elif instance.type in OUTPUT_STATUS_EVENTS_MAPPING.keys():
+         Output.update_output_status(instance)
++    elif instance.type == System.HARD_RESET:
++        instance.device.set_config_not_up_to_date()
+diff --git a/src/events/tests/__init__.py b/src/events/tests/__init__.py
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/src/events/tests/test_models.py b/src/events/tests/test_models.py
+new file mode 100644
+index 00000000..18b02ca9
+--- /dev/null
++++ b/src/events/tests/test_models.py
+@@ -0,0 +1,36 @@
++from django.test import TestCase, mock
++
++from alarms.static_data import ALARMS
++from devices.static_data import OUTPUT_STATUS_EVENTS_MAPPING
++from events.models import Event
++from power_quality.static_data import VOLTAGE_QUALITY_MAPPING
++from static_data.events import System
++
++
++class TestEventDispatch(TestCase):
++    def setUp(self):
++        pass
++
++    @mock.patch('alarms.notif.create_alarm')
++    def test_create_alarm(self, create_alarm):
++        for event_type in list(item['event'] for item in ALARMS):
++            e = Event.create(type=event_type)
++            create_alarm.assert_called_with(e)
++
++    @mock.patch('power_quality.models.VoltageQuality.create_voltage_quality')
++    def test_voltage_quality(self, create_voltage_quality):
++        for event_type in VOLTAGE_QUALITY_MAPPING.keys():
++            e = Event.create(type=event_type)
++            create_voltage_quality.assert_called_with(e)
++
++    @mock.patch('devices.models.Output.update_output_status')
++    def test_device_output_update(self, update_output_status):
++        for event_type in OUTPUT_STATUS_EVENTS_MAPPING.keys():
++            e = Event.create(type=event_type)
++            update_output_status.assert_called_with(e)
++
++    @mock.patch('devices.models.Device.set_config_not_up_to_date')
++    def test_hard_reset(self, set_config_not_up_to_date):
++        event_type = System.HARD_RESET
++        Event.create(type=event_type)
++        set_config_not_up_to_date.assert_called_with()
+diff --git a/src/history/admin.py b/src/history/admin.py
+index 21b44e97..a196e733 100644
+--- a/src/history/admin.py
++++ b/src/history/admin.py
+@@ -5,9 +5,11 @@ from django.conf import settings
+ 
+ from customers.models import Customer
+ from history.models import HistoryEvent, History
++from utils.pagination import LargeTablePaginator
+ 
+ 
+ class HistoryEventsAdmin(admin.ModelAdmin):
++    paginator = LargeTablePaginator
+     list_display = ('id', 'get_users_display', 'timestamp', 'action', 'instance', 'details')
+     list_filter = ('user', 'action', ('timestamp', DateRangeFilter),)
+     list_display_links = None
+@@ -42,6 +44,7 @@ class CustomerFilter(admin.SimpleListFilter):
+ 
+ 
+ class HistoryAdmin(admin.ModelAdmin):
++    paginator = LargeTablePaginator
+     list_display = ('id', 'user', 'timestamp', 'action', 'details')
+     list_filter = ('user', 'action', ('timestamp', DateRangeFilter), CustomerFilter)
+     list_display_links = None
+diff --git a/src/monitoring/admin.py b/src/monitoring/admin.py
+index 0d4b21bb..7b5783ed 100644
+--- a/src/monitoring/admin.py
++++ b/src/monitoring/admin.py
+@@ -4,12 +4,13 @@ from django.utils.translation import ugettext_lazy as _
+ from monitoring.models import MonitoringGetCommands, MonitoringSetCommands, MonitoringRebootCommands, MonitoringFirmwareUpgradeCommands, \
+     MonitoringFactoryResetCommands
+ from utils.admin import get_device
++from utils.pagination import LargeTablePaginator
+ 
+ 
+ class BaseMonitoringCommandsAdmin(admin.ModelAdmin):
++    paginator = LargeTablePaginator
+     list_display = ('get_name', 'creator', get_device, 'status', 'get_creation_date', 'get_response_date')
+     list_filter = ('status', ('creator', admin.RelatedOnlyFieldListFilter))
+-    ordering = ('-creation_date',)
+     search_fields = ('id', 'device__serial_number', 'name')
+ 
+     def has_add_permission(self, request, obj=None):
+diff --git a/src/notifications/admin.py b/src/notifications/admin.py
+index 1bd5c052..859fd059 100644
+--- a/src/notifications/admin.py
++++ b/src/notifications/admin.py
+@@ -1,9 +1,11 @@
+ from django.contrib import admin
+ 
+ from notifications.models import Notification
++from utils.pagination import LargeTablePaginator
+ 
+ 
+ class NotificationAdmin(admin.ModelAdmin):
++    paginator = LargeTablePaginator
+     list_display = ('id', 'user', 'status', 'timestamp', 'type')
+     list_filter = ('user', 'status')
+     search_fields = ('type', 'id')
+diff --git a/src/power_quality/admin.py b/src/power_quality/admin.py
+index a29704d4..bf9ec775 100644
+--- a/src/power_quality/admin.py
++++ b/src/power_quality/admin.py
+@@ -1,21 +1,17 @@
+ from django.contrib import admin
+ from django.utils.translation import ugettext_lazy as _
+ 
++from utils.admin import AdminItemsPerPage
++from utils.pagination import LargeTablePaginator
+ from .models import VoltageQuality
+ 
+ 
+-class VoltageQualityAdmin(admin.ModelAdmin):
+-    list_display = ('id', 'get_customer', 'type', 'phase', 'timestamp', 'get_duration', 'get_device', 'get_site')
++class VoltageQualityAdmin(AdminItemsPerPage, admin.ModelAdmin):
++    paginator = LargeTablePaginator
++    list_display = ('id', 'type', 'phase', 'timestamp', 'get_duration', 'device', 'get_site')
+     list_filter = ('device__customer', )
+     search_fields = ('name', 'id')
+ 
+-    def get_customer(self, obj):
+-        customer = obj.device.customer
+-        return "<a href='/admin/customers/customer/{}'>{}</a>".format(customer.id, customer.name)
+-    get_customer.allow_tags = True
+-    get_customer.short_description = _('Customer')
+-    get_customer.admin_order_field = 'device__customer__name'
+-
+     def get_site(self, obj):
+         if not hasattr(obj.device, 'site'):
+             return '-'
+@@ -25,12 +21,6 @@ class VoltageQualityAdmin(admin.ModelAdmin):
+     get_site.short_description = _('Site')
+     get_site.admin_order_field = 'device__site__name'
+ 
+-    def get_device(self, obj):
+-        return "<a href='/admin/devices/device/{}'>{}</a>".format(obj.device.id, obj.device.serial_number)
+-    get_device.allow_tags = True
+-    get_device.short_description = _('Device')
+-    get_device.admin_order_field = 'device'
+-
+     def get_duration(self, obj):
+         if obj.duration is None:
+             return '-'
+diff --git a/src/real_time/backend/mongodb.py b/src/real_time/backend/mongodb.py
+index 40da3c02..34fa38e2 100644
+--- a/src/real_time/backend/mongodb.py
++++ b/src/real_time/backend/mongodb.py
+@@ -64,7 +64,7 @@ class Client:
+         customer = site.customer
+         end_time = datetime.now(tz=utc)
+         start_time = end_time - timedelta(days=3)
+-        data = self.get(site_id, start_time=None, end_time=None)
++        data = self.get(site_id, start_time=start_time, end_time=end_time)
+         start_time_short = SupportedLanguages.format_date(language=language, ts=start_time, date_format='%d %B %Y')
+         end_time_short = SupportedLanguages.format_date(language=language, ts=end_time, date_format='%d %B %Y')
+         start_time = SupportedLanguages.format_date(language=language, ts=start_time, date_format='%d %B %Y %H:%M')
+diff --git a/src/reports/admin.py b/src/reports/admin.py
+index 6e3af369..f6e875f1 100644
+--- a/src/reports/admin.py
++++ b/src/reports/admin.py
+@@ -6,8 +6,9 @@ from import_export import resources
+ from import_export.fields import Field
+ from suit.widgets import SuitSplitDateTimeWidget
+ 
++from utils.pagination import LargeTablePaginator
+ from .models import Report
+-from utils.admin import get_device, ExportMixin
++from utils.admin import ExportMixin, DeviceSearch, LargeQueryChangeList, AdminItemsPerPage
+ 
+ 
+ class Export(resources.ModelResource):
+@@ -33,22 +34,23 @@ class ReportModelForm(ModelForm):
+         }
+ 
+ 
+-class ReportAdmin(ExportMixin, admin.ModelAdmin):
++class ReportAdmin(AdminItemsPerPage, DeviceSearch, ExportMixin, admin.ModelAdmin):
++    paginator = LargeTablePaginator
+     # export
+     resource_class = Export
+     # display
+     form = ReportModelForm
+-    list_display = ('get_payload', get_device, 'timestamp', 'creation_date', 'get_report_offset', 'ip_address', 'network_interface',
++    list_display = ('get_payload', 'device', 'timestamp', 'creation_date', 'get_report_offset', 'ip_address', 'network_interface',
+                     'get_size', 'get_measurements', 'get_energy', 'get_events')
+-    list_filter = ('device__type', ('timestamp', DateRangeFilter), 'network_interface')
+-    ordering = ('-creation_date',)
++    list_filter = ('device__type', ('timestamp', DateRangeFilter), 'network_interface', 'device__id')
+     search_fields = ('device__serial_number',)
+     list_display_links = None
+ 
+-    # display device serial number with a link to the device
+-    get_device.short_description = _('Device Serial Number')
+-    get_device.allow_tags = True
+-    get_device.admin_order_field = 'device__serial_number'
++    def get_changelist(self, request, **kwargs):
++        """
++        Returns the ChangeList class for use on the changelist page.
++        """
++        return LargeQueryChangeList
+ 
+     # display the lenght or the report
+     def get_size(self, report):
+diff --git a/src/reports/migrations/0004_auto_20171130_1055.py b/src/reports/migrations/0004_auto_20171130_1055.py
+new file mode 100644
+index 00000000..e44bf292
+--- /dev/null
++++ b/src/reports/migrations/0004_auto_20171130_1055.py
+@@ -0,0 +1,19 @@
++# -*- coding: utf-8 -*-
++from __future__ import unicode_literals
++
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('reports', '0003_auto_20170127_1558'),
++    ]
++
++    operations = [
++        migrations.AlterField(
++            model_name='report',
++            name='device',
++            field=models.ForeignKey(verbose_name='Device', to='devices.Device'),
++        ),
++    ]
+diff --git a/src/reports/models.py b/src/reports/models.py
+index bcfe586d..eb9f1b73 100644
+--- a/src/reports/models.py
++++ b/src/reports/models.py
+@@ -31,7 +31,7 @@ class Report(models.Model):
+     payload = models.TextField(verbose_name=_('Payload'), validators=[json_valid])
+     creation_date = models.DateTimeField(auto_now_add=True, verbose_name=_('Receipt Date'))
+     ip_address = models.GenericIPAddressField(verbose_name=_('IP Address'), null=True, blank=True)
+-    device = models.ForeignKey(Device, verbose_name=_('Device ID'))
++    device = models.ForeignKey(Device, verbose_name=_('Device'))
+     network_interface = models.PositiveSmallIntegerField(verbose_name=_('Active network interface'), default=NetworkInterface.undefined,
+                                                          choices=NetworkInterface.iterable_choices())
+ 
+diff --git a/src/reports/tests/test_views.py b/src/reports/tests/test_views.py
+index c39345c8..e4d5fd0a 100644
+--- a/src/reports/tests/test_views.py
++++ b/src/reports/tests/test_views.py
+@@ -116,6 +116,18 @@ class ReportBaseTestCase(TestCase):
+         expected_loss = 0.06
+         self.assertEqual(round(data.loss, 4), expected_loss)
+ 
++    def test_calculate_efficiency(self):
++        """
++        Tests that after sending a report, the server calculates the loss factor with the correct value using the data of the report and
++        save it in the datalog table.
++        """
++        request = self.factory.post('/reports', json.dumps(reports_body.report_valid), content_type="Application/json")
++        force_authenticate(request, user=self.user)
++        create_report(request)
++        data = DataLog.objects.first()
++        expected_efficiency = 100 * 0.036 / (0.036 + 0.06)
++        self.assertEqual(round(data.efficiency, 3), round(expected_efficiency, 3))
++
+     def test_calculate_unbalance(self):
+         """
+         Tests that after sending a report, the server calculates the loss factor with the correct value using the data of the report and
+@@ -318,6 +330,30 @@ class ReportBaseTestCase(TestCase):
+         for k, v in expected_secondary_data_log.items():
+             self.assertEqual(v, getattr(meter2_data_log, k))
+ 
++    def test_report_with_dual_mtr_loss(self):
++        # make sure in this test there are no data logs in case they were added in the setUp
++        DataLog.objects.all().delete()
++        request = self.factory.post('/reports', json.dumps(reports_body.report_valid_with_dual_meter), content_type="Application/json")
++        self.device.type = DeviceType.dual_meter
++        self.device.save()
++        force_authenticate(request, user=self.user)
++        create_report(request)
++        self.assertEqual(DataLog.objects.count(), 2)
++        data_log = DataLog.objects.get(interface=Interface.meter1)
++        self.assertEqual(data_log.loss, 3)
++
++    def test_report_with_dual_mtr_efficiency(self):
++        # make sure in this test there are no data logs in case they were added in the setUp
++        DataLog.objects.all().delete()
++        request = self.factory.post('/reports', json.dumps(reports_body.report_valid_with_dual_meter), content_type="Application/json")
++        self.device.type = DeviceType.dual_meter
++        self.device.save()
++        force_authenticate(request, user=self.user)
++        create_report(request)
++        self.assertEqual(DataLog.objects.count(), 2)
++        data_log = DataLog.objects.get(interface=Interface.meter1)
++        self.assertEqual(round(data_log.efficiency, 4), round(100 * 6 / 9, 4))
++
+     def test_report_time_gap(self):
+         self.device.config = None
+         self.device.save()
+diff --git a/src/reports/utils.py b/src/reports/utils.py
+index 614d563d..5a1ebeb1 100644
+--- a/src/reports/utils.py
++++ b/src/reports/utils.py
+@@ -4,6 +4,7 @@ from django.db import transaction
+ from django.utils import dateparse
+ from iso8601 import parse_date
+ 
++from adapter.tasks import forward_report
+ from data_log.enum import Interface
+ from data_log.models import DataLog, Pulse
+ from devices.enum import DeviceType
+@@ -202,3 +203,4 @@ def parse_report(request, report, dev):
+     for event in events:
+         state = EventState.get_event_state(event)
+         Event(type=event['type'], timestamp=parse_date(event['ts']), device=dev, state=state, report=r).save()
++    forward_report(r)
+diff --git a/src/reports/views.py b/src/reports/views.py
+index 3b77a796..8fdb5648 100644
+--- a/src/reports/views.py
++++ b/src/reports/views.py
+@@ -19,7 +19,6 @@ from .utils import parse_report
+ from .models import Report
+ from .exceptions import AccessDenied
+ from .serializers import ReportSerializer, ReportWriteSerializer
+-from utils.pagination import AngularDatatablePagination
+ from utils.exceptions import BadFormat
+ from utils.logging import Logger
+ from devices.models import Device
+@@ -102,7 +101,6 @@ class ReportList(generics.ListCreateAPIView):
+         device_id(int): filter reports by device id
+         device_sn(str): filter reports by device serial number
+     """
+-    pagination_class = AngularDatatablePagination
+ 
+     def get_serializer_class(self):
+         if self.request.method == 'GET':
+diff --git a/src/settings/graphql/schema.py b/src/settings/graphql/schema.py
+index 26086e23..6a223bd6 100644
+--- a/src/settings/graphql/schema.py
++++ b/src/settings/graphql/schema.py
+@@ -6,6 +6,8 @@ import data_log.schema
+ import users_management.schema
+ import device_configuration.schema
+ import stats.schema
++import energy_cost.schema
++import alarms.schema
+ 
+ 
+ class Query(devices.schema.Query,
+@@ -14,6 +16,8 @@ class Query(devices.schema.Query,
+             users_management.schema.Query,
+             device_configuration.schema.Query,
+             stats.schema.Query,
++            energy_cost.schema.Query,
++            alarms.schema.Query,
+             graphene.ObjectType):
+     pass
+ 
+diff --git a/src/settings/settings.py b/src/settings/settings.py
+index 6ef58c29..16609083 100644
+--- a/src/settings/settings.py
++++ b/src/settings/settings.py
+@@ -60,12 +60,13 @@ INSTALLED_APPS = (
+     'rest_framework',
+     'daterange_filter',
+     'corsheaders',
+-    # 'debug_toolbar',
++    'debug_toolbar',
+     # 'django_jenkins',
+     'import_export',
+     'channels',
+     'graphene_django',
+ 
++    'adapter',
+     'parameters',
+     'commands_handler',
+     'reports',
+@@ -96,6 +97,7 @@ AUTHENTICATION_BACKENDS = (
+ )
+ 
+ MIDDLEWARE_CLASSES = (
++    'debug_toolbar.middleware.DebugToolbarMiddleware',
+     'corsheaders.middleware.CorsMiddleware',
+     'django.middleware.common.CommonMiddleware',
+     'django.middleware.csrf.CsrfViewMiddleware',
+@@ -156,7 +158,28 @@ AUTH_PASSWORD_VALIDATORS = [
+     },
+ ]
+ 
++DEBUG_TOOLBAR_PANELS = [
++    'debug_toolbar.panels.versions.VersionsPanel',
++    'debug_toolbar.panels.timer.TimerPanel',
++    'debug_toolbar.panels.settings.SettingsPanel',
++    'debug_toolbar.panels.headers.HeadersPanel',
++    'debug_toolbar.panels.request.RequestPanel',
++    'debug_toolbar.panels.sql.SQLPanel',
++    'debug_toolbar.panels.staticfiles.StaticFilesPanel',
++    'debug_toolbar.panels.templates.TemplatesPanel',
++    'debug_toolbar.panels.cache.CachePanel',
++    'debug_toolbar.panels.signals.SignalsPanel',
++    'debug_toolbar.panels.logging.LoggingPanel',
++    'debug_toolbar.panels.redirects.RedirectsPanel',
++]
++
++
++def show_toolbar(request):
++    return DEBUG
+ 
++
++INTERNAL_IPS = ['localhost', '127.0.0.1']
++SHOW_TOOLBAR_CALLBACK = show_toolbar
+ # Internationalization
+ # https://docs.djangoproject.com/en/1.8/topics/i18n/
+ 
+@@ -437,3 +460,10 @@ NGINX_HOSTNAME = os.environ.get('NGINX_HOSTNAME', 'localhost')
+ GRAPHENE = {
+     'SCHEMA': 'schema.schema'
+ }
++
++V2_BACKEND = {
++    'ENABLE': os.environ.get('ENABLE_V2_FORWARDING') == 'True',
++    'HOST': os.environ.get('KAFKA_HOST'),
++    'PORT': os.environ.get('KAFKA_PORT'),
++    'DATA_TOPIC': os.environ.get('KAFKA_DATA'),
++}
+diff --git a/src/settings/urls.py b/src/settings/urls.py
+index 3ea8301a..7545faf1 100644
+--- a/src/settings/urls.py
++++ b/src/settings/urls.py
+@@ -80,6 +80,8 @@ urlpatterns = [
+     url(r'^admin/data_log/last_energy/(?P<pk>\d+)', data_log.views.get_device_last_energy_log),
+     url(r'^admin/data_log/last_measurements/(?P<pk>\d+)', data_log.views.get_device_last_measurement_log),
+     url(r'^admin/reports/payload/(?P<report_id>\d+)', payload),
++    url(r'^admin/sites/hot-spot-and-lol/(?P<site_id>[0-9]+)', transformers.views.update_hot_spot_and_loss_of_life),
++    url(r'^admin/sites/efficiency/(?P<site_id>[0-9]+)', data_log.views.update_site_efficiency),
+     url(r'^admin/commands_handler/details/(?P<command_id>\d+)', commands_handler.views.details),
+     url(r'^admin/devices/connect/(?P<pk>\d+)', devices.views.device_connection_request),
+     url(r'^admin/', include(admin.site.urls)),
+@@ -110,6 +112,7 @@ urlpatterns = [
+         name='site-historical-measurement'),
+     url(r'^api/sites/(?P<site>\d+)/last_measurements/?$', data_log.views.GetLastMeasurement.as_view(),
+         name='site-last-measurement'),
++    url(r'^api/alarms/history/?$', alarms.views.GetAlarmsHistory.as_view(),),
+     # ------------------------- UI endpoints ----------------------------------
+     url(r'^api/calendars/', include('energy_cost.urls')),
+     url(r'^api/voltage_quality/?$', power_quality.views.VoltageQualityList.as_view(), name='voltage-quality-list'),
+@@ -121,6 +124,7 @@ urlpatterns = [
+     url(r'^api/sites/stat/average-load/(?P<site>\d*)/?$', stats.views.GetAverageLoad.as_view()),
+     url(r'^api/sites/stat/load-factor/(?P<site>\d*)/?$', stats.views.GetLoadFactor.as_view()),
+     url(r'^api/groups/stat/consumed_energy/(?P<group>\d*)/?$', stats.views.GetConsumedEnergy.as_view()),
++    url(r'^api/transformers/loss-of-life/(?P<site>\d*)/?$', stats.views.GetTransformerLossOfLife.as_view()),
+     url(r'^api/sites/stat/?$', transformers.views.GetSitesStat.as_view()),
+     url(r'^api/sites/commands/(?P<site>\d+)/?$', devices.views.manage_outputs,),
+     url(r'^api/commands/history/?$', history.views.CommandsHistoryList.as_view(),),
+@@ -132,7 +136,6 @@ urlpatterns = [
+     url(r'^api/alerts/energy/config/?$', alarms.views.EnergyAlertConfigurationList.as_view()),
+     url(r'^api/alerts/energy/?$', alarms.views.EnergyAlertList.as_view()),
+     url(r'^api/alarms/stat/?$', alarms.views.GetAlarmsStat.as_view()),
+-    url(r'^api/alarms/history/?$', alarms.views.GetAlarmsHistory.as_view(),),
+     url(r'^api/alarms/?$', alarms.views.AlarmList.as_view(), name='alarm-list'),
+     url(r'^api/address_book/test/(?P<pk>[0-9]+)/?$', alarms.views.test_address_book_notification, name='test-addressbook'),
+     url(r'^api/address_book/(?P<pk>[0-9]+)/?$', alarms.views.AddressBookDetails.as_view(), name='addressbook-detail'),
+@@ -156,4 +159,8 @@ urlpatterns = [
+ ]
+ 
+ if settings.DEBUG:
++    import debug_toolbar
+     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
++    urlpatterns = [
++        url(r'^__debug__/', include(debug_toolbar.urls)),
++    ] + urlpatterns
+diff --git a/src/stats/migrations/0001_initial.py b/src/stats/migrations/0001_initial.py
+new file mode 100644
+index 00000000..eabb28a8
+--- /dev/null
++++ b/src/stats/migrations/0001_initial.py
+@@ -0,0 +1,28 @@
++# -*- coding: utf-8 -*-
++from __future__ import unicode_literals
++
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('transformers', '0018_auto_20171204_1624'),
++    ]
++
++    operations = [
++        migrations.CreateModel(
++            name='TransformerLossOfLife',
++            fields=[
++                ('id', models.AutoField(serialize=False, auto_created=True, verbose_name='ID', primary_key=True)),
++                ('timestamp', models.DateTimeField(verbose_name='Timestamp', db_index=True)),
++                ('factor', models.FloatField(verbose_name='Loss of life factor')),
++                ('duration', models.FloatField(verbose_name='Duration')),
++                ('transformer', models.ForeignKey(to='transformers.Transformer')),
++            ],
++            options={
++                'verbose_name_plural': 'Transformers loss of life',
++                'verbose_name': 'Transformer loss of life',
++            },
++        ),
++    ]
+diff --git a/src/stats/migrations/0002_auto_20180117_1236.py b/src/stats/migrations/0002_auto_20180117_1236.py
+new file mode 100644
+index 00000000..62e996d6
+--- /dev/null
++++ b/src/stats/migrations/0002_auto_20180117_1236.py
+@@ -0,0 +1,19 @@
++# -*- coding: utf-8 -*-
++from __future__ import unicode_literals
++
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('stats', '0001_initial'),
++    ]
++
++    operations = [
++        migrations.AlterField(
++            model_name='transformerlossoflife',
++            name='duration',
++            field=models.FloatField(verbose_name='Duration (s)'),
++        ),
++    ]
+diff --git a/src/stats/models.py b/src/stats/models.py
+new file mode 100644
+index 00000000..0d47e445
+--- /dev/null
++++ b/src/stats/models.py
+@@ -0,0 +1,55 @@
++from django.db import models
++from django.utils.translation import ugettext_lazy as _
++from django.conf import settings
++
++
++class TransformerLossOfLife(models.Model):
++    transformer = models.ForeignKey('transformers.Transformer')
++    timestamp = models.DateTimeField(verbose_name=_('Timestamp'), db_index=True)
++    factor = models.FloatField(verbose_name=_('Loss of life factor'))
++    duration = models.FloatField(verbose_name=_('Duration (s)'))
++
++    class Meta:
++        verbose_name = _('Transformer loss of life')
++        verbose_name_plural = _('Transformers loss of life')
++
++    @staticmethod
++    def enhanced_paper_loss_of_life(hot_spot_temperature):
++        """
++        get the loss of life factor for enhanced paper
++
++        Args:
++            hot_spot_temperature: the transformer hot spot value
++
++        Returns:
++            the transformer loss of life factor
++        """
++        from math import exp
++        return exp(15000/383 - 15000/(hot_spot_temperature+273))
++
++    @staticmethod
++    def non_enhanced_paper_loss_of_life(hot_spot_temperature):
++        """
++        get the loss of life factor for non enhanced paper
++
++        Args:
++            hot_spot_temperature: the transformer hot spot value
++
++        Returns:
++            the transformer loss of life factor
++        """
++        return pow(2, (hot_spot_temperature - 98) / 6)
++
++    @classmethod
++    def get_loss_of_life(cls, hot_spot_temperature, paper_is_enhanced):
++        if paper_is_enhanced:
++            return cls.enhanced_paper_loss_of_life(hot_spot_temperature)
++        return cls.non_enhanced_paper_loss_of_life(hot_spot_temperature)
++
++    @classmethod
++    def create(cls, transformer, timestamp, hot_spot_temperature):
++        if not hot_spot_temperature:
++            return
++        factor = cls.get_loss_of_life(hot_spot_temperature, transformer.enhanced_paper)
++        duration = factor * settings.INTEGRATION_PERIOD * 60  # the value will be stored in seconds (integration period in minutes * 60s)
++        return cls.objects.create(transformer=transformer, timestamp=timestamp, factor=factor, duration=duration)
+diff --git a/src/stats/schema.py b/src/stats/schema.py
+index 2970bf45..89d592f8 100644
+--- a/src/stats/schema.py
++++ b/src/stats/schema.py
+@@ -1,8 +1,9 @@
+ import graphene
+ 
++from utils.access import limit_queryset_access
+ from utils.validators import validate_datetime
+ from transformers.models import Site
+-from .utils import meter_pulses
++from .utils import meter_pulses, get_loss_stat, get_load_average_stat, get_efficiency
+ 
+ 
+ class MeterGraph(graphene.ObjectType):
+@@ -44,9 +45,159 @@ class MeterGraph(graphene.ObjectType):
+         return self['timestamp']
+ 
+ 
++class LossesGraph(graphene.ObjectType):
++    total_loss = graphene.Float()
++    i2r_loss = graphene.Float()
++    pec_loss = graphene.Float()
++    no_load_loss = graphene.Float()
++    timestamp = graphene.String()
++
++    def resolve_total_loss(self, info, **kwargs):
++        return self.get('total_loss')
++
++    def resolve_i2r_loss(self, info, **kwargs):
++        return self.get('i2r_loss')
++
++    def resolve_pec_loss(self, info, **kwargs):
++        return self.get('pec_loss')
++
++    def resolve_no_load_loss(self, info, **kwargs):
++        return self.get('no_load_loss')
++
++    def resolve_timestamp(self, info, **kwargs):
++        return self.get('timestamp')
++
++
++class ValueTimestampGraph(graphene.ObjectType):
++    value = graphene.Float()
++    timestamp = graphene.String()
++
++    def resolve_value(self, info, **kwargs):
++        return self.get('value')
++
++    def resolve_timestamp(self, info, **kwargs):
++        if self.get('timestamp'):
++            return self.get('timestamp').isoformat()
++
++
++class LoadGraph(graphene.ObjectType):
++    avg = graphene.Float()
++    min = graphene.Field(ValueTimestampGraph)
++    max = graphene.Field(ValueTimestampGraph)
++    data = graphene.List(ValueTimestampGraph)
++    peak = graphene.List(ValueTimestampGraph)
++
++    def resolve_data(self, info, **kwargs):
++        return map(lambda elem: elem['avg'], self)
++
++    def resolve_peak(self, info, **kwargs):
++        return map(lambda elem: elem['max'], self)
++
++    def resolve_min(self, info, **kwargs):
++        data = list(filter(lambda elem: elem['avg']['value'] is not None, self))
++        if not data:
++            return {}
++        min = data[0]['avg']['value']
++        timestamp = data[0]['avg']['timestamp']
++        for element in data:
++            if min > element['avg']['value']:
++                min = element['avg']['value']
++                timestamp = element['avg']['timestamp']
++        return {
++            'value': min,
++            'timestamp': timestamp
++        }
++
++    def resolve_max(self, info, **kwargs):
++        data = list(filter(lambda elem: elem['avg']['value'] is not None, self))
++        if not data:
++            return {}
++        max = data[0]['avg']['value']
++        timestamp = data[0]['avg']['timestamp']
++        for element in data:
++            if max < element['avg']['value']:
++                max = element['avg']['value']
++                timestamp = element['avg']['timestamp']
++        return {
++            'value': max,
++            'timestamp': timestamp
++        }
++
++    def resolve_avg(self, info, **kwargs):
++        data = filter(lambda elem: elem['avg']['value'] is not None, self)
++        if not data:
++            return {}
++        data = list(map(lambda elem: elem['avg']['value'], data))
++        return sum(data) / len(data)
++
++
++class EfficiencyDataGraph(graphene.ObjectType):
++    timestamp = graphene.String()
++    value = graphene.Float()
++
++    def resolve_timestamp(self, info, **kwargs):
++        return self.get('timestamp')
++
++    def resolve_value(self, info, **kwargs):
++        return self.get('data')
++
++
++class EfficiencyGraph(graphene.ObjectType):
++    min = graphene.Field(ValueTimestampGraph)
++    max = graphene.Field(ValueTimestampGraph)
++    avg = graphene.Float()
++    data = graphene.List(EfficiencyDataGraph)
++
++    def resolve_data(self, info, **kwargs):
++        return self.get('data')
++
++    def resolve_min(self, info, **kwargs):
++        data = list(filter(lambda elem: elem.get('data') is not None, self.get('data')))
++        if not data:
++            return {}
++        min = data[0]['data']
++        timestamp = data[0]['timestamp']
++        for element in data:
++            if min > element['data']:
++                min = element['data']
++                timestamp = element['timestamp']
++        return {
++            'value': min,
++            'timestamp': timestamp
++        }
++
++    def resolve_max(self, info, **kwargs):
++        data = list(filter(lambda elem: elem.get('data') is not None, self.get('data')))
++        if not data:
++            return {}
++        max = data[0]['data']
++        timestamp = data[0]['timestamp']
++        for element in data:
++            if max < element['data']:
++                max = element['data']
++                timestamp = element['timestamp']
++        return {
++            'value': max,
++            'timestamp': timestamp
++        }
++
++    def resolve_avg(self, info, **kwargs):
++        data = filter(lambda elem: elem.get('data') is not None, self.get('data'))
++        if not data:
++            return {}
++        data = list(map(lambda elem: elem.get('data'), data))
++        return sum(data) / len(data)
++
++
+ class Query(graphene.AbstractType):
+     meters = graphene.List(MeterGraph, site_id=graphene.Int(), start_date=graphene.String(), end_date=graphene.String(),
+                            display=graphene.String())
++    losses = graphene.List(LossesGraph, site_id=graphene.Int(), start_date=graphene.String(), end_date=graphene.String(),
++                           display=graphene.String())
++    load = graphene.Field(LoadGraph, site_id=graphene.Int(), start_date=graphene.String(), end_date=graphene.String(),
++                          display=graphene.String())
++    efficiency = graphene.Field(EfficiencyGraph, site_id=graphene.Int(), start_date=graphene.String(), end_date=graphene.String(),
++                                display=graphene.String())
+ 
+     @staticmethod
+     def get_inputs_list(info):
+@@ -61,9 +212,39 @@ class Query(graphene.AbstractType):
+         end_date = kwargs.get('end_date')
+         display = kwargs.get('display')
+         input_number = Query.get_inputs_list(info)
+-        site = Site.objects.filter(id=site_id, group__in=info.context.user.customeruser.get_groups()).distinct()
++        site = limit_queryset_access(Site.objects.all(), info).filter(id=site_id)
+         tz = site[0].customer.get_timezone()
+         start_date, end_date = validate_datetime(start_date, end_date)
+         start_date = start_date.replace(tzinfo=tz)
+         end_date = end_date.replace(tzinfo=tz)
+         return meter_pulses(site, start_date, end_date, display, True, inputs=input_number)
++
++    def resolve_losses(self, info, **kwargs):
++        site_id = kwargs.get('site_id')
++        start_date = kwargs.get('start_date')
++        end_date = kwargs.get('end_date')
++        display = kwargs.get('display')
++        site = limit_queryset_access(Site.objects.all(), info).filter(id=site_id)
++        start_date, end_date = validate_datetime(start_date, end_date)
++        data = get_loss_stat(sites=site, start_date=start_date, end_date=end_date, display=display)
++        return data
++
++    def resolve_load(self, info, **kwargs):
++        site_id = kwargs.get('site_id')
++        start_date = kwargs.get('start_date')
++        end_date = kwargs.get('end_date')
++        display = kwargs.get('display')
++        site = limit_queryset_access(Site.objects.filter(id=site_id), info).filter(id=site_id).first()
++        start_date, end_date = validate_datetime(start_date, end_date)
++        return get_load_average_stat(site=site, start_date=start_date, end_date=end_date, display=display)
++
++    def resolve_efficiency(self, info, **kwargs):
++        site_id = kwargs.get('site_id')
++        start_date = kwargs.get('start_date')
++        end_date = kwargs.get('end_date')
++        display = kwargs.get('display')
++        site = limit_queryset_access(Site.objects.all(), info).get(id=site_id)
++        start_date, end_date = validate_datetime(start_date, end_date)
++        return {
++            'data': get_efficiency(site=site, start_date=start_date, end_date=end_date, display=display).get_data()
++        }
+diff --git a/src/stats/tests/test_models.py b/src/stats/tests/test_models.py
+new file mode 100644
+index 00000000..b4ae316c
+--- /dev/null
++++ b/src/stats/tests/test_models.py
+@@ -0,0 +1,67 @@
++import copy
++import json
++
++from django.test import TestCase, mock, RequestFactory
++from django.utils import timezone
++from rest_framework.test import force_authenticate
++
++from device_configuration.models import Config
++from devices.models import Device
++from reports.tests.reports_body import report_valid
++from reports.views import create_report
++from stats.models import TransformerLossOfLife
++from transformers.enum import TransformerCoolingMethods
++from transformers.models import Transformer, Site
++
++
++class TestTransformerLossOfLife(TestCase):
++    def setUp(self):
++        pass
++
++    def test_non_enhanced_paper(self):
++        lol_factor = TransformerLossOfLife.get_loss_of_life(52.8974782, False)
++        self.assertEqual(round(lol_factor, 6), 0.005459)
++
++    def test_enhanced_paper(self):
++        lol_factor = TransformerLossOfLife.get_loss_of_life(52.8974782, True)
++        self.assertEqual(round(lol_factor, 6), 0.001047)
++
++    @mock.patch('stats.models.TransformerLossOfLife.non_enhanced_paper_loss_of_life')
++    @mock.patch('stats.models.TransformerLossOfLife.enhanced_paper_loss_of_life')
++    def test_dispatch(self, enhanced_paper_lol, non_enhanced_paper_lol):
++        TransformerLossOfLife.get_loss_of_life(20, True)
++        enhanced_paper_lol.assert_called_with(20)
++        TransformerLossOfLife.get_loss_of_life(30, False)
++        non_enhanced_paper_lol.assert_called_with(30)
++
++    def test_loss_of_life_values(self):
++        self.factory = RequestFactory()
++        c = Config.create()
++        c.rtd.filter(number=1).update(name='(TO)')
++        c.rtd.filter(number=2).update(name='(BO)')
++        dev = Device.create(config=c)
++        trans = Transformer.create(cooling=TransformerCoolingMethods.on, winding_exponent=1.6, winding_temperature_gradient=23,
++                                   hot_spot_factor=1.1, load_rating=630, enhanced_paper=True)
++        Site.create(device=dev, transformer=trans)
++        t = timezone.now()
++        report = copy.deepcopy(report_valid)
++        report['data'][0]['AVGT'] = {
++            'RTD1': 5202,
++            'RTD2': 4108,
++            'RTD3': 0,
++            'RTD4': 0,
++            'AT': 3692
++        }
++        report['data'][0]['AVGE']['Pa'] = 21910
++        report['data'][0]['AVGE']['Pb'] = 0
++        report['data'][0]['AVGE']['Pc'] = 0
++        report['data'][0]['AVGE']['Qa'] = 0
++        report['data'][0]['AVGE']['Qb'] = 0
++        report['data'][0]['AVGE']['Qc'] = 0
++        report['data'][0]['ts'] = str(t)
++        report['params']['DEV']['sn'] = dev.serial_number
++        request = self.factory.post('/reports', json.dumps(report), content_type="Application/json")
++        force_authenticate(request, user=dev.user)
++        create_report(request)
++        TransformerLossOfLife.get_loss_of_life(53.3452745, True)
++        self.assertEqual(TransformerLossOfLife.objects.count(), 1)
+diff --git a/src/stats/tests/test_views.py b/src/stats/tests/test_views.py
+index 0ec0847d..5360a43e 100644
+--- a/src/stats/tests/test_views.py
++++ b/src/stats/tests/test_views.py
+@@ -183,7 +183,7 @@ class AverageLoadStat(AbstractDataLogData):
+         res = json.loads(response.content.decode('utf-8'))
+         result = []
+         for elem in res:
+-            result.append(elem['value'])
++            result.append(elem['avg']['value'])
+         expected_result = [round(100 * (self.data11.sa + self.data11.sb + self.data11.sc) / self.load_rating, 2),
+                            round(100 * (self.data12.sa + self.data13.sa + self.data12.sb + self.data13.sb + self.data12.sc +
+                                         self.data13.sc) / (2 * self.load_rating), 2)]
+@@ -1133,14 +1133,14 @@ class PulseTest(TestCase):
+ 
+         expected_response = [
+             {
+-                'value': 90,
+-                'timestamp': '2017-01-01T00:00:00Z'
++                '1': 90,
++                'timestamp': '2017-01-01T00:00:00+00:00'
+             }, {
+-                'value': 45,
+-                'timestamp': '2017-01-01T01:00:00Z'
++                '1': 45,
++                'timestamp': '2017-01-01T01:00:00+00:00'
+             }, {
+-                'value': None,
+-                'timestamp': '2017-01-01T02:00:00Z'
++                '1': None,
++                'timestamp': '2017-01-01T02:00:00+00:00'
+             },
+         ]
+ 
+@@ -1162,14 +1162,14 @@ class PulseTest(TestCase):
+ 
+         expected_response = [
+             {
+-                'value': 30,
+-                'timestamp': '2017-01-01T00:00:00Z'
++                '1': 30,
++                'timestamp': '2017-01-01T00:00:00+00:00'
+             }, {
+-                'value': 15,
+-                'timestamp': '2017-01-01T01:00:00Z'
++                '1': 15,
++                'timestamp': '2017-01-01T01:00:00+00:00'
+             }, {
+-                'value': None,
+-                'timestamp': '2017-01-01T02:00:00Z'
++                '1': None,
++                'timestamp': '2017-01-01T02:00:00+00:00'
+             },
+         ]
+         res = json.loads(response.content.decode('utf-8'))
+@@ -1185,7 +1185,7 @@ class EfficiencyTest(TestCase):
+         self.site = Site.create(customer=self.customer, type=SiteType.transformer_monitoring)
+         self.t0 = datetime(2017, 1, 1, tzinfo=utc)
+         self.t1 = datetime(2017, 2, 1, tzinfo=utc)
+-        self.t2 = datetime(2017, 3, 1, tzinfo=utc)
++        self.t2 = datetime(2017, 2, 2, tzinfo=utc)
+         self.t3 = datetime(2017, 4, 1, tzinfo=utc)
+         self.r = Report.create()
+ 
+@@ -1194,14 +1194,13 @@ class EfficiencyTest(TestCase):
+                               '?start_date=2017-01-01T00:00:00Z'
+                               '&end_date=2017-05-01T00:00:00Z'
+                               '&display=month'.format(self.site.id))
+-
+         self.assertEqual(response.status_code, 204)
+ 
+     def test_simple_meter_efficiency(self):
+-        DataLog.objects.create(device=self.site.device, timestamp=self.t0, report=self.r, va=1, pt=99, loss=1, interface=Interface.meter1)
+-        DataLog.objects.create(device=self.site.device, timestamp=self.t1, report=self.r, va=1, pt=88, loss=12, interface=Interface.meter1)
+-        DataLog.objects.create(device=self.site.device, timestamp=self.t2, report=self.r, va=1, pt=0, loss=0, interface=Interface.meter1)
+-        DataLog.objects.create(device=self.site.device, timestamp=self.t3, report=self.r, va=1, pt=75, loss=25, interface=Interface.meter1)
++        DataLog.objects.create(device=self.site.device, timestamp=self.t0, report=self.r, va=1, interface=Interface.meter1, efficiency=20)
++        DataLog.objects.create(device=self.site.device, timestamp=self.t1, report=self.r, va=1, interface=Interface.meter1, efficiency=20)
++        DataLog.objects.create(device=self.site.device, timestamp=self.t2, report=self.r, va=1, interface=Interface.meter1, efficiency=None)
++        DataLog.objects.create(device=self.site.device, timestamp=self.t3, report=self.r, va=1, interface=Interface.meter1, efficiency=20)
+ 
+         response = self.c.get('/api/sites/stat/efficiency/{}'
+                               '?start_date=2017-01-01T00:00:00Z'
+@@ -1211,30 +1210,25 @@ class EfficiencyTest(TestCase):
+         expected_response = [
+             {
+                 'timestamp': '2017-01-01T00:00:00Z',
+-                'data': 99.0
++                'data': 20.0
+             }, {
+                 'timestamp': '2017-02-01T00:00:00Z',
+-                'data': 88.0
++                'data': 20.0
+             }, {
+                 'timestamp': '2017-03-01T00:00:00Z',
+                 'data': None
+             }, {
+                 'timestamp': '2017-04-01T00:00:00Z',
+-                'data': 75.0
++                'data': 20.0
+             }
+         ]
+         self.assertEqual(json.loads(response.content.decode('utf-8')), expected_response)
+ 
+     def test_dual_meter_efficiency(self):
+-        DataLog.objects.create(device=self.site.device, timestamp=self.t0, report=self.r, va=1, pt=99, loss=20, interface=Interface.meter2)
+-        DataLog.objects.create(device=self.site.device, timestamp=self.t1, report=self.r, va=1, pt=88, loss=20, interface=Interface.meter2)
+-        DataLog.objects.create(device=self.site.device, timestamp=self.t2, report=self.r, va=1, pt=0, loss=20, interface=Interface.meter2)
+-        DataLog.objects.create(device=self.site.device, timestamp=self.t3, report=self.r, va=1, pt=75, loss=205, interface=Interface.meter2)
+-
+-        DataLog.objects.create(device=self.site.device, timestamp=self.t0, report=self.r, va=1, pt=0, loss=1, interface=Interface.meter1)
+-        DataLog.objects.create(device=self.site.device, timestamp=self.t1, report=self.r, va=1, pt=0, loss=12, interface=Interface.meter1)
+-        DataLog.objects.create(device=self.site.device, timestamp=self.t2, report=self.r, va=1, pt=0, loss=0, interface=Interface.meter1)
+-        DataLog.objects.create(device=self.site.device, timestamp=self.t3, report=self.r, va=1, pt=0, loss=25, interface=Interface.meter1)
++        DataLog.objects.create(device=self.site.device, timestamp=self.t0, report=self.r, va=1, efficiency=20, interface=Interface.meter1)
++        DataLog.objects.create(device=self.site.device, timestamp=self.t1, report=self.r, va=1, efficiency=20, interface=Interface.meter1)
++        DataLog.objects.create(device=self.site.device, timestamp=self.t2, report=self.r, va=1, efficiency=20, interface=Interface.meter1)
++        DataLog.objects.create(device=self.site.device, timestamp=self.t3, report=self.r, va=1, efficiency=20, interface=Interface.meter1)
+ 
+         self.site.device.type = DeviceType.dual_meter
+         self.site.device.save()
+@@ -1247,16 +1241,16 @@ class EfficiencyTest(TestCase):
+         expected_response = [
+             {
+                 'timestamp': '2017-01-01T00:00:00Z',
+-                'data': 99.0
++                'data': 20.0
+             }, {
+                 'timestamp': '2017-02-01T00:00:00Z',
+-                'data': 88.0
++                'data': 20.0
+             }, {
+                 'timestamp': '2017-03-01T00:00:00Z',
+                 'data': None
+             }, {
+                 'timestamp': '2017-04-01T00:00:00Z',
+-                'data': 75.0
++                'data': 20.0
+             }
+         ]
+         self.assertEqual(json.loads(response.content.decode('utf-8')), expected_response)
+diff --git a/src/stats/utils.py b/src/stats/utils.py
+index f25e5688..b96603be 100644
+--- a/src/stats/utils.py
++++ b/src/stats/utils.py
+@@ -84,8 +84,11 @@ def dual_meter_sites_loss(devices, time_intervals):
+     data_loss = []
+     for i in range(len(time_intervals) - 1):
+         from data_log.models import MeasurementsDataLog
+-        losses = MeasurementsDataLog.objects.filter(timestamp__gte=time_intervals[i], timestamp__lt=time_intervals[i + 1],
+-                                                    device__in=devices).aggregate(Sum('loss'))
++        losses = MeasurementsDataLog.objects.filter(timestamp__gte=time_intervals[i],
++                                                    timestamp__lt=time_intervals[i + 1],
++                                                    device__in=devices,
++                                                    timestamp__second=0)\
++                                            .aggregate(Sum('loss'))
+         loss = losses['loss__sum']
+         if loss:
+             loss = round(loss / (60 / settings.INTEGRATION_PERIOD), 2)
+@@ -102,8 +105,11 @@ def single_meter_sites_loss(devices, time_intervals):
+     data_loss = []
+     for i in range(len(time_intervals) - 1):
+         from data_log.models import MeasurementsDataLog
+-        losses = MeasurementsDataLog.objects.filter(timestamp__gte=time_intervals[i], timestamp__lt=time_intervals[i + 1],
+-                                                    device__in=devices).aggregate(Sum('loss'), Sum('i2r_loss'), Sum('pec_loss'))
++        losses = MeasurementsDataLog.objects.filter(timestamp__gte=time_intervals[i],
++                                                    timestamp__lt=time_intervals[i + 1],
++                                                    device__in=devices,
++                                                    timestamp__second=0)\
++                                            .aggregate(Sum('loss'), Sum('i2r_loss'), Sum('pec_loss'))
+         loss = losses['loss__sum']
+         i2r_loss = losses['i2r_loss__sum']
+         pec_loss = losses['pec_loss__sum']
+@@ -133,6 +139,7 @@ def get_loss_stat(start_date, end_date, customer=None, sites=None, display=None)
+     empty_data = {'empty': {'details': 'no data found'}}
+     if sites:
+         devices = Device.objects.filter(site__in=sites, site__type=SiteType.transformer_monitoring)
++
+     else:
+         return empty_data
+     if not devices.exists():
+@@ -159,26 +166,42 @@ def get_load_average_stat(start_date, end_date, site, display):
+     Returns:
+         A list of dict containing timestamp and value if there is data, or a dict containing 'empty' key.
+     """
++    from data_log.models import MeasurementsDataLog
+     time_intervals = get_time_intervals(start_date, end_date, display)
+     load_average = []
+     device = site.device
++    customer = site.customer
+     if device.type == DeviceType.meter:
+         interface = Interface.meter1
+     else:
+         interface = Interface.meter2
++    measurements = MeasurementsDataLog.objects.filter(device=device, interface=interface).annotate(s_total=F('sa') + F('sb') + F('sc'))
++    if not measurements.exists:
++        return []
+     for i in range(len(time_intervals)-1):
+-        from data_log.models import MeasurementsDataLog
+-        queryset = MeasurementsDataLog.objects.filter(timestamp__gte=time_intervals[i], timestamp__lt=time_intervals[i+1], device=device,
+-                                                      interface=interface)
++        queryset = measurements.filter(timestamp__gte=time_intervals[i], timestamp__lt=time_intervals[i+1], device=device,
++                                       interface=interface)
+         datalog_number = queryset.count()
+-        res = queryset.aggregate(Sum('sa'), Sum('sb'), Sum('sc'))
+-        value = round(100 * (res['sa__sum'] + res['sb__sum'] + res['sc__sum']) / (datalog_number * device.site.transformer.load_rating), 2)\
+-            if datalog_number != 0 and device.site.transformer.load_rating else None
+-        load_average.append({'timestamp': time_intervals[i], 'value': value})
++        if datalog_number != 0 and device.site.transformer.load_rating:
++            res = queryset.aggregate(sum=Sum('s_total'))
++            value = round(100 * res['sum'] / (datalog_number * device.site.transformer.load_rating), 2)
++            maximum = queryset.latest('s_total')
++            max_value = round(100 * maximum.s_total / device.site.transformer.load_rating, 2)
++            data = {
++                'avg': {'timestamp': time_intervals[i], 'value': value},
++                'max': {'value': max_value, 'timestamp': customer.to_customer_tz(maximum.timestamp)}
++            }
++        else:
++            data = {
++                'avg': {'timestamp': time_intervals[i], 'value': None},
++                'max': {'timestamp': None, 'value': None}
++            }
++        load_average.append(data)
++
+     for elem in load_average:
+-        if elem['value'] is not None:
++        if elem['avg']['value'] is not None:
+             return load_average
+-    return {'empty': {'details': 'no data found'}}
++    return {}
+ 
+ 
+ def get_load_factor_stat(start_date, end_date, site, display):
+@@ -474,56 +497,45 @@ def meter_pulses(sites, start_date, end_date, display, details, inputs):
+     return result
+ 
+ 
+-class Efficiency:
++def get_efficiency(site, start_date, end_date, display):
++    from data_log.models import MeasurementsDataLog
++    time_intervals = get_time_intervals(start_date, end_date, display)
++    data = []
++    for i in range(len(time_intervals) - 1):
++        value = MeasurementsDataLog.objects.filter(timestamp__gte=time_intervals[i],
++                                                   timestamp__lt=time_intervals[i+1],
++                                                   device=site.device) \
++            .aggregate(value=Avg('efficiency'))['value']
++        data.append({
++            'timestamp': time_intervals[i],
++            'data': value
++        })
++    for i in data:
++        if i['data']:
++            return data
++    return {'empty': {'details': 'No data to display'}}
+ 
+-    def __init__(self, site, start_date, end_date, display):
+-        self.site = site
+-        self.time_intervals = get_time_intervals(start_date, end_date, display)
+ 
+-    def simple_meter_efficiency(self, start_date, end_date):
+-        from data_log.models import MeasurementsDataLog
+-        efficiency = MeasurementsDataLog.objects.filter(interface=Interface.meter1,
+-                                                        timestamp__gte=start_date,
+-                                                        timestamp__lt=end_date,
+-                                                        device=self.site.device)\
+-                                        .aggregate(total_power=Sum('pt'), total_loss=Sum('loss'))
+-        power = efficiency['total_power']
+-        loss = efficiency['total_loss']
+-        return power, loss
+-
+-    def dual_meter_efficiency(self, start_date, end_date):
+-        from data_log.models import MeasurementsDataLog
+-        power = MeasurementsDataLog.objects.filter(interface=Interface.meter2,
+-                                                   timestamp__gte=start_date,
+-                                                   timestamp__lt=end_date,
+-                                                   device=self.site.device)\
+-                                   .aggregate(total_power=Sum('pt'))['total_power']
+-
+-        loss = MeasurementsDataLog.objects.filter(interface=Interface.meter1,
+-                                                  timestamp__gte=start_date,
+-                                                  timestamp__lt=end_date,
+-                                                  device=self.site.device)\
+-                                  .aggregate(total_loss=Sum('loss'))['total_loss']
+-        return power, loss
+-
+-    def calculate(self):
+-        if self.site.device.type == DeviceType.dual_meter:
+-            return self.dual_meter_efficiency
+-        return self.simple_meter_efficiency
+-
+-    def get_data(self):
+-        has_data = False
+-        calculate = self.calculate()
+-        data = []
+-        for i in range(len(self.time_intervals) - 1):
+-            power, loss = calculate(self.time_intervals[i], self.time_intervals[i + 1])
+-            value = 100 * power / (power + loss) if (power is not None) and (loss is not None) and (power + loss) else None
+-            if value and not has_data:
+-                has_data = True
+-            data.append({
+-                'timestamp': self.time_intervals[i],
+-                'data': value
+-            })
+-        if not has_data:
+-            return {'empty': {'details': 'No data to display'}}
+-        return data
++def get_loss_of_life(start_date, end_date, transformer, display):
++    """
++    Get the loss of life of a transformer
++    Args:
++        transformer: The site to filter with
++        start_date: Must be a Datetime object
++        end_date:  Must be a Datetime object
++        display: Can be either year, month, day or None, represents the period in which to calculate the load average.
++    Returns:
++        A list of dict containing timestamp and loss of life duration for each period
++    """
++    from .models import TransformerLossOfLife
++    queryset = TransformerLossOfLife.objects.filter(timestamp__gte=start_date, timestamp__lt=end_date, transformer=transformer)
++    if not queryset.exists():
++        return {}
++    time_intervals = get_time_intervals(start_date, end_date, display)
++    res = []
++    for i in range(len(time_intervals)-1):
++        value = queryset.filter(
++            timestamp__gte=time_intervals[i],
++            timestamp__lt=time_intervals[i+1]).aggregate(Sum('duration'))['duration__sum']
++        res.append({'timestamp': time_intervals[i], 'data': value})
++    return res
+diff --git a/src/stats/views.py b/src/stats/views.py
+index 8907d008..c73e8363 100644
+--- a/src/stats/views.py
++++ b/src/stats/views.py
+@@ -8,7 +8,7 @@ from energy_cost.enum import CalendarTypes
+ from energy_cost.models import Calendar, Rate
+ from power_quality.enum import VoltageQualityType
+ from stats.utils import get_loss_stat, get_load_average_stat, get_load_factor_stat, get_voltage_quality, \
+-    consumed_energy_without_shifts, consumed_energy_with_shift, meter_pulses, Efficiency
++    consumed_energy_without_shifts, consumed_energy_with_shift, meter_pulses, get_loss_of_life, get_efficiency
+ from utils.mixins import SiteWithMetering
+ from utils.views import GenericView
+ 
+@@ -248,7 +248,7 @@ class GetMeterDetails(GenericView):
+             if not self.check_input_access(input_number, sites):
+                 return Response({'details': 'Invalid input'}, status=400)
+         data = meter_pulses(sites, start_date, end_date, display, details, inputs=inputs)
+-        if data is None:
++        if not data:
+             return Response(status=204)
+         return Response(data, status=200)
+ 
+@@ -264,7 +264,32 @@ class GetEfficiency(GenericView):
+         site = self.get_sites()[0]
+         start_date, end_date = self.get_dates()
+         display = self.get_display_param()
+-        data = Efficiency(site=site, start_date=start_date, end_date=end_date, display=display).get_data()
++        data = get_efficiency(site=site, start_date=start_date, end_date=end_date, display=display)
+         if 'empty' in data:
+             return Response(data['empty'], status=204)
+         return Response(data, status=200)
++
++
++class GetTransformerLossOfLife(GenericView):
++
++    def get_groups(self):
++        return self.get_transformer().group_set.all()
++
++    def get_transformer(self):
++        from transformers.models import Transformer
++        user_groups = self.get_user().get_groups()
++        site_id = self.kwargs.get('site', self.request.GET.get('site', None))
++        if site_id:
++            transformer = get_object_or_404(Transformer, site__id=site_id)
++            if not any(group in transformer.group_set.all() for group in user_groups):
++                raise exceptions.PermissionDenied('Unauthorized access')
++            return transformer
++
++    def get(self, *args, **kwargs):
++        transformer = self.get_transformer()
++        start_date, end_date = self.get_dates()
++        display = self.get_display_param()
++        data = get_loss_of_life(start_date=start_date, end_date=end_date, transformer=transformer, display=display)
++        if not data:
++            return Response({'details': 'no data found'}, status=204)
++        return Response(data, status=200)
+diff --git a/src/transformers/admin.py b/src/transformers/admin.py
+index bdacaada..e68ff02f 100644
+--- a/src/transformers/admin.py
++++ b/src/transformers/admin.py
+@@ -7,7 +7,7 @@ from transformers.forms import GroupFeatureForm
+ from transformers.models import Group
+ from transformers.enum import SiteType
+ from transformers.models import Transformer, Site
+-from utils.admin import ExportMixin
++from utils.admin import ExportMixin, AdminItemsPerPage
+ 
+ 
+ def get_customer(obj):
+@@ -30,11 +30,10 @@ class ExportTransformer(resources.ModelResource):
+         export_order = fields
+ 
+ 
+-class TransformerAdmin(ExportMixin, admin.ModelAdmin):
++class TransformerAdmin(AdminItemsPerPage, ExportMixin, admin.ModelAdmin):
+     # export
+     resource_class = ExportTransformer
+     # display
+-    ordering = ('-creation_date', )
+     list_display = ('id', get_customer, 'manufacturer', 'serial_number', 'load_rating', 'display_site', 'get_health_index',
+                     'get_maintenance_index')
+     search_fields = ('id', 'serial_number', 'manufacturer',)
+@@ -87,12 +86,11 @@ class ExportSite(resources.ModelResource):
+         export_order = fields
+ 
+ 
+-class SiteAdmin(ExportMixin, admin.ModelAdmin):
++class SiteAdmin(AdminItemsPerPage, ExportMixin, admin.ModelAdmin):
+     # export
+     resource_class = ExportSite
+     # display
+     list_select_related = True
+-    ordering = ('-creation_date', )
+     search_fields = ('id', 'name')
+     list_filter = ('customer', )
+     list_display = ('id', 'name', 'get_status', get_customer, 'subscribed_power', 'obj_transformer', 'obj_device',
+@@ -122,20 +120,24 @@ class SiteAdmin(ExportMixin, admin.ModelAdmin):
+     obj_device.short_description = _('Device')
+ 
+     def get_custom_actions(self, obj):
+-        # return '<a href="/admin/data_log/charts/?site={}" data-toggle="tooltip" title="Data Charts" ' \
+-        #        'class="custom_actions">Data Charts</a>'.format(obj.id) + \
+-        return '<a href="/admin/data_log/last_measurements/{}" data-toggle="tooltip" title="Last measurements" ' \
+-               'class="custom_actions">Last measurements</a><br>'.format(obj.device.id) + \
+-               '<a href="/admin/data_log/last_energy/{}" data-toggle="tooltip" title="Last energy" ' \
+-               'class="custom_actions">Last energy</a>'.format(obj.device.id) + \
+-               '<br><a href="/admin/data_log/measurementsdatalog/?q={}" data-toggle="tooltip" title="Data">' \
+-               'Measurements</a>'.format(obj.device.serial_number) + \
+-               '<br><a href="/admin/data_log/energydatalog/?q={}" data-toggle="tooltip" title="Data">' \
+-               'Energy</a>'.format(obj.device.serial_number) + \
+-               '<br><a href="/admin/events/event/?q={}" data-toggle="tooltip" title="Events">' \
+-               'Events</a>'.format(obj.device.serial_number) + \
+-               '<br><a href="/admin/alarms/alarm/?q=&device__id__exact={}" data-toggle="tooltip" title="Alarms">' \
+-               'Alarms</a>'.format(obj.device.id)
++        actions = '<a href="/admin/data_log/last_measurements/{}" data-toggle="tooltip" title="Last measurements" ' \
++                   'class="custom_actions">Last measurements</a><br>'.format(obj.device.id) + \
++                   '<a href="/admin/data_log/last_energy/{}" data-toggle="tooltip" title="Last energy" ' \
++                   'class="custom_actions">Last energy</a>'.format(obj.device.id) + \
++                   '<br><a href="/admin/data_log/measurementsdatalog/?q={}" data-toggle="tooltip" title="Data">' \
++                   'Measurements</a>'.format(obj.device.serial_number) + \
++                   '<br><a href="/admin/data_log/energydatalog/?q={}" data-toggle="tooltip" title="Data">' \
++                   'Energy</a>'.format(obj.device.serial_number) + \
++                   '<br><a href="/admin/events/event/?q={}" data-toggle="tooltip" title="Events">' \
++                   'Events</a>'.format(obj.device.serial_number) + \
++                   '<br><a href="/admin/alarms/alarm/?q=&device__id__exact={}" data-toggle="tooltip" title="Alarms">' \
++                   'Alarms</a>'.format(obj.device.id)
++        if obj.type == SiteType.transformer_monitoring:
++            actions += '<br><a href="/admin/sites/hot-spot-and-lol/{}" data-toggle="tooltip" title="Update Hot Spot and loss of life">' \
++                       'Update Hot Spot and loss of life</a>'.format(obj.id)
++            actions += '<br><a href="/admin/sites/efficiency/{}" data-toggle="tooltip" title="Update efficiency">' \
++                       'Update efficiency</a>'.format(obj.id)
++        return actions
+     get_custom_actions.allow_tags = True
+     get_custom_actions.short_description = _('Actions')
+ 
+@@ -162,7 +164,7 @@ class SiteAdmin(ExportMixin, admin.ModelAdmin):
+         }
+ 
+ 
+-class GroupAdmin(admin.ModelAdmin):
++class GroupAdmin(AdminItemsPerPage, admin.ModelAdmin):
+     form = GroupFeatureForm
+     list_display = ('id', 'name', 'sites_count')
+     list_filter = ('customer',)
+diff --git a/src/transformers/enum.py b/src/transformers/enum.py
+index 07a7dc87..8d5653c9 100644
+--- a/src/transformers/enum.py
++++ b/src/transformers/enum.py
+@@ -57,3 +57,45 @@ class GroupFeaturesType:
+             cls.loss,
+             cls.power_and_current
+         ]
++
++
++class TransformerCoolingMethods:
++
++    on = 'oil_natural'
++    of = 'oil_forced'
++    od = 'oil_directed'
++
++    @classmethod
++    def iterable_choices(cls):
++        return (
++            (cls.on, _('Oil natural')),
++            (cls.of, _('Oil forced')),
++            (cls.od, _('Oil directed')),
++        )
++
++    @classmethod
++    def hot_spot_factor(cls, cooling, s_rated):
++        H = {
++            cls.on: lambda load_rating: 1.1 if load_rating < 3150 else 1.3,
++            cls.of: lambda load_rating: 1.3,
++            cls.od: lambda load_rating: 1.3
++        }
++        return H[cooling](s_rated)
++
++    @classmethod
++    def winding_temperature_gradient(cls, cooling, s_rated):
++        GR = {
++            cls.on: lambda load_rating: 21 if load_rating < 3150 else 20,
++            cls.of: lambda load_rating: 17,
++            cls.od: lambda load_rating: 22
++        }
++        return GR[cooling](s_rated)
++
++    @classmethod
++    def winding_exponent(cls, cooling):
++        y = {
++            cls.on: 1.6,
++            cls.of: 1.6,
++            cls.od: 2,
++        }
++        return y[cooling]
+diff --git a/src/transformers/migrations/0018_auto_20171204_1624.py b/src/transformers/migrations/0018_auto_20171204_1624.py
+new file mode 100644
+index 00000000..e436335d
+--- /dev/null
++++ b/src/transformers/migrations/0018_auto_20171204_1624.py
+@@ -0,0 +1,41 @@
++# -*- coding: utf-8 -*-
++from __future__ import unicode_literals
++
++from django.db import migrations, models
++import utils.validators
++import django.core.validators
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('transformers', '0017_auto_20171002_1641'),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name='transformer',
++            name='cooling',
++            field=models.CharField(blank=True, max_length=50, choices=[('oil_natural', 'Oil natural'), ('oil_forced', 'Oil forced'), ('oil_directed', 'Oil directed')], verbose_name='Cooling method'),
++        ),
++        migrations.AddField(
++            model_name='transformer',
++            name='hot_spot_factor',
++            field=models.FloatField(validators=[utils.validators.strictly_greater_than_zero], verbose_name='Hot spot factor', null=True),
++        ),
++        migrations.AddField(
++            model_name='transformer',
++            name='winding_exponent',
++            field=models.FloatField(validators=[utils.validators.strictly_greater_than_zero], verbose_name='Winding exponent', null=True),
++        ),
++        migrations.AddField(
++            model_name='transformer',
++            name='winding_temperature_gradient',
++            field=models.FloatField(validators=[utils.validators.strictly_greater_than_zero], verbose_name='Winding temperature gradient', null=True),
++        ),
++        migrations.AlterField(
++            model_name='transformer',
++            name='short_circuit_impedance',
++            field=models.FloatField(blank=True, validators=[django.core.validators.MinValueValidator(limit_value=0), django.core.validators.MaxValueValidator(limit_value=100)], verbose_name='Short circuit impedance (%)', null=True),
++        ),
++    ]
+diff --git a/src/transformers/migrations/0019_transformer_enhanced_paper.py b/src/transformers/migrations/0019_transformer_enhanced_paper.py
+new file mode 100644
+index 00000000..cb2df4c6
+--- /dev/null
++++ b/src/transformers/migrations/0019_transformer_enhanced_paper.py
+@@ -0,0 +1,19 @@
++# -*- coding: utf-8 -*-
++from __future__ import unicode_literals
++
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('transformers', '0018_auto_20171204_1624'),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name='transformer',
++            name='enhanced_paper',
++            field=models.NullBooleanField(verbose_name='Paper is enhanced'),
++        ),
++    ]
+diff --git a/src/transformers/migrations/0020_auto_20171212_1428.py b/src/transformers/migrations/0020_auto_20171212_1428.py
+new file mode 100644
+index 00000000..ca25a3ec
+--- /dev/null
++++ b/src/transformers/migrations/0020_auto_20171212_1428.py
+@@ -0,0 +1,30 @@
++# -*- coding: utf-8 -*-
++from __future__ import unicode_literals
++
++from django.db import migrations, models
++import utils.validators
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('transformers', '0019_transformer_enhanced_paper'),
++    ]
++
++    operations = [
++        migrations.AlterField(
++            model_name='transformer',
++            name='hot_spot_factor',
++            field=models.FloatField(verbose_name='Hot spot factor', null=True, blank=True, validators=[utils.validators.strictly_greater_than_zero]),
++        ),
++        migrations.AlterField(
++            model_name='transformer',
++            name='winding_exponent',
++            field=models.FloatField(verbose_name='Winding exponent', null=True, blank=True, validators=[utils.validators.strictly_greater_than_zero]),
++        ),
++        migrations.AlterField(
++            model_name='transformer',
++            name='winding_temperature_gradient',
++            field=models.FloatField(verbose_name='Winding temperature gradient', null=True, blank=True, validators=[utils.validators.strictly_greater_than_zero]),
++        ),
++    ]
+diff --git a/src/transformers/models.py b/src/transformers/models.py
+index f2055919..bf8b800a 100644
+--- a/src/transformers/models.py
++++ b/src/transformers/models.py
+@@ -17,11 +17,12 @@ from devices.models import Device
+ from energy_cost.enum import CalendarTypes
+ from energy_cost.models import Calendar
+ from energy_cost.tasks import remove_site_shifts, add_site_shifts
+-from transformers.enum import TransformerFrequency, SiteAlarmStatus, SiteType
++from transformers.enum import TransformerFrequency, SiteAlarmStatus, SiteType, TransformerCoolingMethods
+ from transformers.static_data import load_loss_classes, no_load_loss_classes
+ from utils.access import get_customer_by_user
+ from utils.db_fields import ChainedOneTOOne
+ from utils.utils import random_string_generator, delete_file
++from utils.validators import strictly_greater_than_zero
+ 
+ 
+ class Transformer(DirtyFieldsMixin, models.Model):
+@@ -43,9 +44,16 @@ class Transformer(DirtyFieldsMixin, models.Model):
+                                                       validators.MaxValueValidator(limit_value=100)])
+     load_loss = models.PositiveIntegerField(verbose_name=_('Load loss (W)'))
+     no_load_loss = models.PositiveIntegerField(verbose_name=_('No Load loss (W)'))
+-    short_circuit_impedance = models.FloatField(verbose_name=_('Short circuit impedence (%)'), null=True, blank=True,
++    short_circuit_impedance = models.FloatField(verbose_name=_('Short circuit impedance (%)'), null=True, blank=True,
+                                                 validators=[validators.MinValueValidator(limit_value=0),
+                                                             validators.MaxValueValidator(limit_value=100)])
++    cooling = models.CharField(verbose_name=_('Cooling method'), max_length=50, choices=TransformerCoolingMethods.iterable_choices(),
++                               blank=True)
++    winding_temperature_gradient = models.FloatField(verbose_name=_('Winding temperature gradient'), blank=True, null=True,
++                                                     validators=[strictly_greater_than_zero])
++    hot_spot_factor = models.FloatField(verbose_name=_('Hot spot factor'), validators=[strictly_greater_than_zero], null=True, blank=True)
++    winding_exponent = models.FloatField(verbose_name=_('Winding exponent'), validators=[strictly_greater_than_zero], null=True, blank=True)
++    enhanced_paper = models.NullBooleanField(verbose_name=_('Paper is enhanced'))
+     creation_date = models.DateTimeField(verbose_name=_('Created at'), null=True, blank=True, auto_now_add=True)
+     update_date = models.DateTimeField(verbose_name=_('Updated at'), null=True, blank=True, auto_now=True)
+ 
+@@ -94,7 +102,8 @@ class Transformer(DirtyFieldsMixin, models.Model):
+     def create(cls, customer=None, customer_id=None, manufacturer=None, serial_number=None, year_of_manufacture=None, frequency=None,
+                primary_voltage=None, primary_current=None, secondary_voltage=None, secondary_current=None,
+                load_rating=None, health_index=None, maintenance_index=None, creation_date=datetime.now(), no_load_loss=None,
+-               load_loss=None, short_circuit_impedance=4):
++               load_loss=None, short_circuit_impedance=4, cooling='', winding_temperature_gradient=None, hot_spot_factor=None,
++               winding_exponent=None, enhanced_paper=None):
+         if customer is None:
+             if customer_id:
+                 customer = Customer.objects.get(id=customer_id)
+@@ -131,7 +140,9 @@ class Transformer(DirtyFieldsMixin, models.Model):
+                                                  primary_voltage=primary_voltage, primary_current=primary_current, load_rating=load_rating,
+                                                  secondary_current=secondary_current, secondary_voltage=secondary_voltage,
+                                                  health_index=health_index, maintenance_index=maintenance_index, no_load_loss=no_load_loss,
+-                                                 load_loss=load_loss, short_circuit_impedance=short_circuit_impedance)
++                                                 load_loss=load_loss, short_circuit_impedance=short_circuit_impedance, cooling=cooling,
++                                                 winding_exponent=winding_exponent, hot_spot_factor=hot_spot_factor,
++                                                 winding_temperature_gradient=winding_temperature_gradient, enhanced_paper=enhanced_paper)
+         return transformer
+ 
+ 
+@@ -227,7 +238,7 @@ class Site(DirtyFieldsMixin, models.Model):
+             if transformer_id:
+                 transformer = Transformer.objects.get(id=transformer_id)
+             else:
+-                transformer = Transformer.create(customer=customer)
++                transformer = Transformer.create(customer=customer, cooling=TransformerCoolingMethods.on)
+         if type == SiteType.measurement_point:
+             transformer = None
+         if device is None:
+@@ -343,7 +354,20 @@ def shifts_to_sites_modified(sender, instance, action, **kwargs):
+     return
+ 
+ 
++class BaseManager(models.Manager):
++    pass
++
++
++class CustomQuerySet(models.QuerySet):
++    def filter(self, *args, **kwargs):
++        group__in = kwargs.pop('group__in', None)
++        if group__in:
++            return super().filter(id__in=group__in, *args, **kwargs)
++        return super().filter(*args, **kwargs)
++
++
+ class Group(DirtyFieldsMixin, models.Model):
++    objects = BaseManager.from_queryset(CustomQuerySet)()
+     customer = models.ForeignKey('customers.Customer')
+     name = models.CharField(verbose_name=_('Name'), max_length=100)
+     description = models.TextField(verbose_name=_('Description'), blank=True)
+@@ -467,6 +491,25 @@ class Group(DirtyFieldsMixin, models.Model):
+             res += group.get_parents(include_child).values_list('id', flat=True)
+         return Group.objects.filter(id__in=res).distinct()
+ 
++    def item_removed_from_group(self):
++        """
++        Makes sure all the items are related to groups.
++        Since it is not possible to check which items where removed for all the groups since m2m_changed signal does not provide the list
++        of removed instances.
++        """
++        from device_configuration.models import Config
++        from alarms.models import AddressBook
++        from alarms.models import EnergyAlertConfiguration
++        root_group = self.customer.get_root_group()
++        related_models = [Site, Transformer, Device, Config, AddressBook, EnergyAlertConfiguration]
++        for model in related_models:
++            for i in model.objects.filter(group__isnull=True, customer=self.customer):
++                i.group_set.add(root_group)
++        for i in Calendar.objects.filter(costs_group__isnull=True, customer=self.customer).exclude(type=CalendarTypes.shift):
++                i.costs_group.add(root_group)
++        for i in Calendar.objects.filter(shifts_group__isnull=True, customer=self.customer, type=CalendarTypes.shift):
++                i.shifts_group.add(root_group)
++
+ 
+ @receiver(pre_delete, sender=Group)
+ def move_items_to_parent_group(instance, **kwargs):
+diff --git a/src/transformers/schema.py b/src/transformers/schema.py
+index 5d7759c8..e9b5b1d8 100644
+--- a/src/transformers/schema.py
++++ b/src/transformers/schema.py
+@@ -1,6 +1,8 @@
+ import graphene
+ from graphene_django.types import DjangoObjectType
+ 
++from utils.access import limit_queryset_access
++from utils.pagination import get_page
+ from utils.validators import validate_datetime
+ from stats.utils import meter_pulses, get_time_intervals
+ from .models import Site, Group, Transformer
+@@ -24,6 +26,8 @@ class InterfaceGraph(graphene.ObjectType):
+ 
+ class groupGraph(DjangoObjectType):
+     groups = graphene.List(lambda: groupGraph)
++    sites_number = graphene.Int()
++    alarm_status = graphene.Boolean()
+ 
+     class Meta:
+         model = Group
+@@ -31,8 +35,14 @@ class groupGraph(DjangoObjectType):
+     def resolve_groups(self, info, **kwargs):
+         return Group.objects.filter(parent=self.id)
+ 
++    def resolve_sites_number(self, info, **kwargs):
++        return Group.objects.get(id=self.id).get_sites().count()
++
++    def resolve_alarm_status(self, info, **kwargs):
++        return Group.objects.get(id=self.id).get_sites().filter(alarm__status=AlarmState.begin).exists()
+ 
+-class SiteGraph(DjangoObjectType):
++
++class SiteModelGraph(DjangoObjectType):
+     alarm_status = graphene.Boolean()
+     interfaces = graphene.Field(InterfaceGraph)
+     groups = graphene.List(groupGraph)
+@@ -74,7 +84,7 @@ class SiteGraph(DjangoObjectType):
+         start_date = kwargs.get('start_date')
+         end_date = kwargs.get('end_date')
+         display = kwargs.get('display')
+-        input_number = SiteGraph.get_inputs_list(info)
++        input_number = SiteModelGraph.get_inputs_list(info)
+         site = Site.objects.filter(id=self.id)
+         tz = site[0].customer.get_timezone()
+         start_date, end_date = validate_datetime(start_date, end_date)
+@@ -109,6 +119,18 @@ class SiteGraph(DjangoObjectType):
+         return result
+ 
+ 
++class SiteGraph(graphene.ObjectType):
++    data = graphene.List(SiteModelGraph)
++    count = graphene.Int()
++
++    def resolve_data(self, info, **kwargs):
++        return self['queryset']
++
++    def resolve_count(self, info, **kwargs):
++        print(type(self))
++        return self['count']
++
++
+ class TransformerGraph(DjangoObjectType):
+     frequency = graphene.Int()
+     no_load_loss_class = graphene.Int()
+@@ -128,8 +150,8 @@ class TransformerGraph(DjangoObjectType):
+ 
+ class Query(graphene.AbstractType):
+     group = graphene.Field(groupGraph, id=graphene.Int())
+-    site = graphene.Field(SiteGraph, id=graphene.Int())
+-    all_sites = graphene.List(SiteGraph)
++    site = graphene.Field(SiteModelGraph, id=graphene.Int())
++    all_sites = graphene.Field(SiteGraph, limit=graphene.Int(), offset=graphene.Int())
+     transformer = graphene.Field(TransformerGraph)
+     all_transformers = graphene.List(TransformerGraph)
+ 
+@@ -141,26 +163,30 @@ class Query(graphene.AbstractType):
+         if group_id is None:
+             return
+ 
+-        return Group.objects.filter(id__in=info.context.user.customeruser.get_groups().values_list('id', flat=True))\
+-                            .distinct()\
+-                            .get(id=group_id)
++        return limit_queryset_access(Group.objects.all(), info).get(id=group_id)
+ 
+     def resolve_site(self, info, **kwargs):
+         site_id = kwargs.get('id')
+         if site_id is None:
+             return
+-        return Site.objects.filter(group__in=info.context.user.customeruser.get_groups()).distinct().get(id=site_id)
++        return limit_queryset_access(Site.objects.all(), info).get(id=site_id)
+ 
+     def resolve_all_sites(self, info, **kwargs):
+-        return Site.objects.filter(group__in=info.context.user.customeruser.get_groups()).distinct()
++        limit = kwargs.get('limit')
++        offset = kwargs.get('offset')
++        queryset = limit_queryset_access(Site.objects.all(), info)
++        count = queryset.count()
++        queryset = get_page(queryset, limit, offset)
++        return {
++            'count': count,
++            'queryset': queryset
++        }
+ 
+     def resolve_transformer(self, info, **kwargs):
+         transformer_id = kwargs.get('id')
+         if transformer_id is None:
+             return
+-        return Transformer.objects.filter(group__in=info.context.user.customeruser.get_groups())\
+-                                  .distinct()\
+-                                  .get(id=transformer_id)
++        return limit_queryset_access(Transformer.objects.all(), info).get(id=transformer_id)
+ 
+     def resolve_all_transformers(self, info, **kwargs):
+-        return Transformer.objects.filter(group__in=info.context.user.customeruser.get_groups()).distinct()
++        return limit_queryset_access(Transformer.objects.all(), info)
+diff --git a/src/transformers/serializers.py b/src/transformers/serializers.py
+index b5a5e42a..7b7a985b 100644
+--- a/src/transformers/serializers.py
++++ b/src/transformers/serializers.py
+@@ -71,7 +71,7 @@ class TransformerSerializer(GroupManagementMixin, serializers.ModelSerializer):
+         fields = ('id', 'manufacturer', 'serial_number', 'year_of_manufacture', 'frequency', 'primary_current', 'primary_voltage',
+                   'secondary_current', 'secondary_voltage', 'load_rating', 'site', 'creation_date', 'update_date', 'health_index',
+                   'maintenance_index', 'load_loss', 'no_load_loss', 'load_loss_class', 'no_load_loss_class', 'short_circuit_impedance',
+-                  'groups')
++                  'groups', 'winding_temperature_gradient', 'hot_spot_factor', 'winding_exponent', 'cooling', 'enhanced_paper')
+ 
+ 
+ class SiteDetailsSerializer(GroupManagementMixin, serializers.HyperlinkedModelSerializer):
+@@ -226,7 +226,8 @@ class TransformerWriteSerializer(GroupManagementMixin, CustomWriteSerializer):
+         model = Transformer
+         fields = ('id', 'customer', 'manufacturer', 'serial_number', 'year_of_manufacture', 'frequency', 'primary_current',
+                   'primary_voltage', 'secondary_current', 'secondary_voltage', 'load_rating', 'health_index', 'maintenance_index',
+-                  'load_loss', 'no_load_loss', 'short_circuit_impedance', 'groups')
++                  'load_loss', 'no_load_loss', 'short_circuit_impedance', 'groups', 'winding_temperature_gradient', 'hot_spot_factor',
++                  'winding_exponent', 'cooling', 'enhanced_paper')
+ 
+     def validate(self, attrs):
+         groups = attrs.pop('group_set', None)
+@@ -451,6 +452,7 @@ class GroupWriteSerializer(CustomWriteSerializer):
+         if instance.parent is None:
+             validated_data.pop('parent')
+         group = super().update(instance, validated_data)
++        group.item_removed_from_group()
+         self.associated_users(users, group)
+         return group
+ 
+diff --git a/src/transformers/tasks.py b/src/transformers/tasks.py
+new file mode 100644
+index 00000000..93fd23ab
+--- /dev/null
++++ b/src/transformers/tasks.py
+@@ -0,0 +1,75 @@
++from celery import shared_task
++from django.db.models import F
++
++from data_log.models import MeasurementsDataLog, DataLog
++from stats.models import TransformerLossOfLife
++from transformers.enum import TransformerCoolingMethods, SiteType
++
++
++def update_hot_spot(site_id):
++    """
++    Script to calculate old values for temperature hot spot
++    updates the data logs of a site with hoy spot temperature values
++    """
++    from transformers.models import Site
++    site = Site.objects.get(id=site_id)
++    if not site.transformer:
++        raise Exception('This must be a transformer monitoring node')
++    if not site.device.config:
++        raise Exception('The device must have a configuration')
++    config = site.device.config
++    transformer = site.transformer
++
++    rated_power = transformer.load_rating
++    cooling = transformer.cooling if transformer.cooling else TransformerCoolingMethods.on
++
++    hot_spot_factor = transformer.hot_spot_factor
++    winding_temperature_gradient = transformer.winding_temperature_gradient
++    winding_exponent = transformer.winding_exponent
++
++    if hot_spot_factor is None:
++        hot_spot_factor = TransformerCoolingMethods.hot_spot_factor(cooling=cooling, s_rated=transformer.load_rating)
++    if winding_exponent is None:
++        winding_exponent = TransformerCoolingMethods.winding_exponent(cooling=cooling)
++    if winding_temperature_gradient is None:
++        winding_temperature_gradient = TransformerCoolingMethods.winding_temperature_gradient(cooling=cooling,
++                                                                                              s_rated=transformer.load_rating)
++    data = DataLog.objects.filter(va__isnull=False, device__site=site).values('st', 'rtd1', 'rtd2', 'rtd3', 'rtd4')
++    top_oil_rtd = config.rtd.filter(name__icontains='(to)')
++    bottom_oil_rtd = config.rtd.filter(name__icontains='(bo)')
++    if not top_oil_rtd.exists():
++        raise Exception('At least top oil must be properly configured')
++    if cooling == TransformerCoolingMethods.on:
++        top_oil = 'rtd' + str(top_oil_rtd.first().number)
++        try:
++            bottom_oil = 'rtd' + str(bottom_oil_rtd.first().number)
++            data.update(
++                hot_spot_temperature=F(top_oil) +
++                ((F('st')/rated_power)**winding_exponent) * hot_spot_factor * winding_temperature_gradient +
++                ((((F(top_oil) + F(bottom_oil))/2) - F('at')) / 12.5))
++            print('finished update transformer with top and bottom oil temperatures')
++        except Exception:
++            data.update(
++                hot_spot_temperature=F(top_oil) +
++                ((F('st')/rated_power)**winding_exponent) * hot_spot_factor * winding_temperature_gradient +
++                (F(top_oil) - F('at')) / (1.25 * 12.5))
++            print('finished update transformer with top oil temperatures only')
++        return
++    else:
++        raise Exception('Other cooling methods not supported')
++
++
++def calculate_loss_of_life(site_id):
++    from transformers.models import Site
++    site = Site.objects.get(id=site_id)
++    if site.type != SiteType.transformer_monitoring:
++        return
++    TransformerLossOfLife.objects.filter(transformer__site=site).delete()
++    for dt in MeasurementsDataLog.objects.filter(device__site__id=site_id, hot_spot_temperature__isnull=False):
++        TransformerLossOfLife.create(transformer=site.transformer, timestamp=dt.timestamp, hot_spot_temperature=dt.hot_spot_temperature)
++
++
++@shared_task(name='update_transformer_monitoring_values', ignore_result=True)
++def update_transformer_monitoring_values(site_id):
++    update_hot_spot(site_id)
++    calculate_loss_of_life(site_id)
+diff --git a/src/transformers/tests/test_view.py b/src/transformers/tests/test_view.py
+index d235525c..f2da1930 100644
+--- a/src/transformers/tests/test_view.py
++++ b/src/transformers/tests/test_view.py
+@@ -326,9 +326,9 @@ class GroupViewTest(TestCase):
+         self.root_group = self.customer.get_root_group()
+ 
+         # 1st Customer related item
+-        self.site3 = Site.create(customer=self.customer, name='site3')
+-        self.site2 = Site.create(customer=self.customer, name='site2')
+         self.site1 = Site.create(customer=self.customer, name='site1')
++        self.site2 = Site.create(customer=self.customer, name='site2')
++        self.site3 = Site.create(customer=self.customer, name='site3')
+ 
+         self.site1.device.serial_number = 'ds1'
+         self.site1.device.save()
+@@ -873,7 +873,7 @@ class GroupViewTest(TestCase):
+         response = self.c.post(groups_url, data=data, format='json')
+         self.assertEqual(response.status_code, 400)
+ 
+-    def test_remove_item_from_all_groups(self):
++    def test_remove_item_from_all_groups_from_item_form(self):
+         data = {
+             'groups': []
+         }
+@@ -881,6 +881,16 @@ class GroupViewTest(TestCase):
+         self.device1.refresh_from_db()
+         self.assertEqual(list(self.device1.group_set.all()), [self.root_group])
+ 
++    def test_remove_item_from_all_groups_from_group_form(self):
++        self.site2.group_set.clear()
++        self.site2.group_set.add(self.group2)
++        data = {
++            'sites': []
++        }
++        self.c.patch('/api/groups/{}/'.format(self.group2.id), data=data, format='json')
++        self.site1.refresh_from_db()
++        self.assertEqual(list(self.site2.group_set.all()), [self.root_group])
++
+     def test_filter_group_by_name(self):
+         expected_response = {
+             'id': self.root_group.id,
+diff --git a/src/transformers/views.py b/src/transformers/views.py
+index 052ac86d..51b3bc85 100644
+--- a/src/transformers/views.py
++++ b/src/transformers/views.py
+@@ -1,4 +1,4 @@
+-from django.shortcuts import get_object_or_404
++from django.shortcuts import get_object_or_404, redirect
+ from django.db.models import Avg, Min, Max, Q, ProtectedError
+ 
+ 
+@@ -17,6 +17,7 @@ from utils.mixins import ListFilterMixin, DetailsFilterMixin
+ from utils.views import GenericView
+ from .models import Transformer, Site, Group
+ from . import serializers
++from .tasks import update_transformer_monitoring_values
+ 
+ 
+ class TransformerFilter(filters.FilterSet):
+@@ -377,3 +378,8 @@ class GetSitesStat(GenericView):
+             }
+         }
+         return Response(data=data, status=status.HTTP_200_OK)
++
++
++def update_hot_spot_and_loss_of_life(request, site_id):
++    update_transformer_monitoring_values.delay(site_id)
++    return redirect('/admin/transformers/site/',)
+diff --git a/src/users_management/schema.py b/src/users_management/schema.py
+index 4af99195..f7a2b260 100644
+--- a/src/users_management/schema.py
++++ b/src/users_management/schema.py
+@@ -5,6 +5,7 @@ from graphene_django.converter import convert_django_field
+ from phonenumber_field.modelfields import PhoneNumberField
+ 
+ from customers.models import Customer
++from utils.access import limit_queryset_access
+ from .models import CustomerUser
+ 
+ 
+@@ -62,4 +63,4 @@ class Query(graphene.AbstractType):
+         user_id = kwargs.get('id')
+         if user_id is None:
+             return
+-        return CustomerUser.objects.filter(group__in=info.context.user.customeruser.get_groups()).distinct().get(id=user_id)
++        return limit_queryset_access(CustomerUser.objects.all(), info).get(id=user_id)
+diff --git a/src/utils/access.py b/src/utils/access.py
+index e9b7b751..cbd515a9 100644
+--- a/src/utils/access.py
++++ b/src/utils/access.py
+@@ -1,3 +1,4 @@
++from django.conf import settings
+ from django.contrib.auth import REDIRECT_FIELD_NAME
+ from django.contrib.auth.decorators import user_passes_test
+ from django.contrib.auth.models import User
+@@ -198,3 +199,9 @@ def check_edit_permissions(user, model):
+     if user_role == CustomerUserRoles.manager and model != CustomerUser:
+         return True
+     return False
++
++
++def limit_queryset_access(queryset, info):
++    if settings.DEBUG and info.context.user.is_anonymous():
++        return queryset
++    return queryset.filter(group__in=info.context.user.customeruser.get_groups()).distinct()
+diff --git a/src/utils/admin.py b/src/utils/admin.py
+index 8bcc6e87..f46924c7 100644
+--- a/src/utils/admin.py
++++ b/src/utils/admin.py
+@@ -1,7 +1,14 @@
++from django.contrib.admin.options import IncorrectLookupParameters
++from django.contrib.admin.views.main import ChangeList, SEARCH_VAR
++from django.core.paginator import InvalidPage
+ from django.utils.translation import ugettext_lazy as _
++
+ from import_export.admin import ExportMixin
+ from import_export.formats import base_formats
+ 
++from devices.models import Device
++from utils.db import estimate_count
++
+ 
+ def get_device(obj):
+     """
+@@ -23,3 +30,66 @@ get_device.admin_order_field = 'device'
+ 
+ class ExportMixin(ExportMixin):
+     formats = tuple((elem for elem in ExportMixin.formats if elem not in [base_formats.ODS, base_formats.YAML, base_formats.XLSX]))
++
++
++class DeviceSearch:
++    """
++    Overrides the keyword search in a ModelAdmin of a model with foreignkey to a device.
++    Remove table join while searching for the device by its serial_number.
++    """
++
++    def get_search_results(self, request, queryset, search_term):
++        search_term = search_term.strip()
++        if search_term:
++            try:
++                device = Device.objects.get(serial_number__icontains=search_term)
++                queryset = queryset.filter(device=device)
++            except (Device.DoesNotExist):
++                pass
++        return queryset, False
++
++
++class LargeQueryChangeList(ChangeList):
++
++    def get_results(self, request):
++        paginator = self.model_admin.get_paginator(request, self.queryset, self.list_per_page)
++        # Get the number of objects, with admin filters applied.
++        result_count = paginator.count
++
++        # Get the total number of objects, with no admin filters applied.
++        # Perform a slight optimization:
++        # full_result_count is equal to paginator.count if no filters
++        # were applied
++        if self.model_admin.show_full_result_count:
++            if self.get_filters_params() or self.params.get(SEARCH_VAR):
++                full_result_count = estimate_count(self.root_queryset)
++            else:
++                full_result_count = result_count
++        else:
++            full_result_count = None
++        can_show_all = result_count <= self.list_max_show_all
++        multi_page = result_count > self.list_per_page
++
++        # Get the list of objects to display on this page.
++        if (self.show_all and can_show_all) or not multi_page:
++            result_list = self.queryset._clone()
++        else:
++            try:
++                result_list = paginator.page(self.page_num + 1).object_list
++            except InvalidPage:
++                raise IncorrectLookupParameters
++
++        self.result_count = result_count
++        self.show_full_result_count = self.model_admin.show_full_result_count
++        # Admin actions are shown if there is at least one entry
++        # or if entries are not counted because show_full_result_count is disabled
++        self.show_admin_actions = not self.show_full_result_count or bool(full_result_count)
++        self.full_result_count = full_result_count
++        self.result_list = result_list
++        self.can_show_all = can_show_all
++        self.multi_page = multi_page
++        self.paginator = paginator
++
++
++class AdminItemsPerPage:
++    list_per_page = 25
+diff --git a/src/utils/db.py b/src/utils/db.py
+index 670b9b8f..4ed02efb 100644
+--- a/src/utils/db.py
++++ b/src/utils/db.py
+@@ -1,4 +1,5 @@
+ from django.db.models import Func, F
++from django.db import connection
+ 
+ 
+ class Round(Func):
+@@ -39,3 +40,15 @@ class MultiParamAvg:
+     def get_avg(self):
+         size = len(self.items)
+         return sum(map(lambda field: F(field), self.items)) / size
++
++
++def estimate_count(q):
++    if not q.query.where:
++        try:
++            cursor = connection.cursor()
++            cursor.execute("SELECT reltuples FROM pg_class WHERE relname = %s",
++                           [q.query.model._meta.db_table])
++            return int(cursor.fetchone()[0])
++        except:
++            pass
++    return q.count()
+diff --git a/src/utils/pagination.py b/src/utils/pagination.py
+index 282a819d..e2298a30 100644
+--- a/src/utils/pagination.py
++++ b/src/utils/pagination.py
+@@ -1,64 +1,27 @@
+-from rest_framework.pagination import BasePagination
+-from rest_framework.response import Response
+-from django.db.models import Q
++from django.core.paginator import Paginator
+ 
+-from settings.settings import REST_MAX_DATA_COUNT
++from utils.db import estimate_count
+ 
+ 
+-class AngularDatatablePagination(BasePagination):
++class LargeTablePaginator(Paginator):
++    """
++    Warning: Postgresql only
++    Overrides the count method of QuerySet objects to get an estimate instead of actual count when not filtered.
++    However, this estimate can be stale and hence not fit for situations where the count of objects actually matter.
++    """
+ 
+-    def paginate_queryset(self, queryset, request, view=None):
+-        """ get parameters """
+-        self.length = int(request.GET.get('length', 0))
+-        self.start = int(request.GET.get('start', 0))
+-        self.draw = int(request.GET.get('draw', 0))
+-        column_data = self.get_column_data(request)
++    def _get_count(self):
++        if self._count:
++            return self._count
++        query = self.object_list
++        self._count = estimate_count(query)
++        return self._count
++    count = property(_get_count)
+ 
+-        if not self.length:
+-            self.length = min(queryset.count(), REST_MAX_DATA_COUNT)
+ 
+-        """ search """
+-        qg = Q()
+-        qs = Q()
+-        search = request.GET.get('search[value]', None)
+-        for col_no, col in enumerate(column_data):
+-            """ global search """
+-            if col['data']:
+-                qg |= Q(**{'{0}__istartswith'.format(col['data']).replace('.', '__'): search})
+-                """ specific search """
+-                if col['search.value']:
+-                    qs &= Q(**{'{0}__istartswith'.format(col['data']).replace('.', '__'): col['search.value']})
+-
+-        """ sorting """
+-        if len(column_data):
+-            sort_col = column_data[int(request.GET.get('order[0][column]', 0))]['data']
+-            sort_dir = '-' if request.GET.get('order[0][dir]', 'asc') == 'desc' else ''
+-            order = '{0}{1}'.format(sort_dir, sort_col.replace('.', '__'))
+-            queryset = queryset.order_by(order)
+-
+-        """ queryset count """
+-        self.recordsTotal = queryset.count()
+-        self.recordsFiltered = queryset.filter(qg).filter(qs).count()
+-        queryset = queryset.filter(qg).filter(qs)
+-
+-        return list(queryset[self.start:self.start + self.length])
+-
+-    def get_paginated_response(self, data):
+-        return Response({
+-            'draw': self.draw,
+-            'recordsTotal': self.recordsTotal,
+-            'recordsFiltered': self.recordsFiltered,
+-            'data': data,
+-        })
+-
+-    def get_column_data(self, request):
+-        column_data = []
+-        i = 0
+-        key = 'columns[{0}][data]'.format(i)
+-        while key in request.GET:
+-            column_data.append({'data': request.GET.get(key),
+-                                'search.value': request.GET.get('columns[{0}][search][value]'.format(i)),
+-                                })
+-            i += 1
+-            key = 'columns[{0}][data]'.format(i)
+-        return column_data
++def get_page(queryset, limit, offset):
++    if limit and offset:
++        queryset = queryset[limit * (offset - 1):limit * offset]
++    if limit:
++        queryset = queryset[:limit]
++    return queryset
+diff --git a/src/utils/utils.py b/src/utils/utils.py
+index dc7bfbf5..484ebee1 100644
+--- a/src/utils/utils.py
++++ b/src/utils/utils.py
+@@ -165,3 +165,13 @@ def chained_getattr(obj, name):
+         for elem in range(1, len(name)):
+             res = getattr(res, name[elem])
+     return res
++
++
++def timestamp_iso_format(ts):
++    if not isinstance(ts, str):
++        raise Exception('This function only accept str timetstamps')
++
++    if re.match(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}\d{2}', ts):
++        return ts.replace(' ', 'T')
++
++    return ts
